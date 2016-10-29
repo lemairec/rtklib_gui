@@ -538,7 +538,7 @@ extern unsigned int crc32(const unsigned char *buff, int len)
     unsigned int crc=0;
     
     trace(4,"crc32: len=%d\n",len);
-    
+    return 0; 
     for (i=0;i<len;i++) {
         crc^=buff[i];
         for (j=0;j<8;j++) {

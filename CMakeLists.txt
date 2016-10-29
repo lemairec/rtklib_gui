@@ -15,10 +15,13 @@ set(rtk_agri_cpp app/rtk_agri/rtk_agri.cpp app/rtk_agri/mainwindow.cpp)
 set(src_rtk_agri ${rtk_agri_hpp} ${rtk_agri_cpp})
 
 SET(CMAKE_INCLUDE_CURRENT_DIR ON)
+ADD_DEFINITIONS(-g -ggdb)
 set(CMAKE_AUTOMOC ON)
 FIND_PACKAGE(Qt5Core)
+FIND_PACKAGE(Threads)
 add_executable(rtk_agri ${sources} ${src_rtk_agri})
 qt5_use_modules(rtk_agri Widgets)
+target_link_libraries(rtk_agri ${CMAKE_THREAD_LIBS_INIT})
 
 ###
 # grouping files for visual studio or xcode
