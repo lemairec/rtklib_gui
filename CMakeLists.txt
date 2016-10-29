@@ -4,14 +4,27 @@ project(rtklib_gui)
 file(GLOB_RECURSE    rtklib_c      lib/*.c)
 include_directories(lib)
 
+
 set(sources ${rtklib_c})
 
-add_executable(str2str ${sources} app/str2str/str2str.c)
-add_executable(rtk_agri ${sources} app/rtk_agri/rtk_agri.c)
+#add_executable(str2str ${sources} app/str2str/str2str.c)
+
+
+set(rtk_agri_hpp app/rtk_agri/mainwindow.hpp app/rtk_agri/include_qt.hpp)
+set(rtk_agri_cpp app/rtk_agri/rtk_agri.cpp app/rtk_agri/mainwindow.cpp)
+set(src_rtk_agri ${rtk_agri_hpp} ${rtk_agri_cpp})
+
+SET(CMAKE_INCLUDE_CURRENT_DIR ON)
+set(CMAKE_AUTOMOC ON)
+FIND_PACKAGE(Qt5Core)
+add_executable(rtk_agri ${sources} ${src_rtk_agri})
+qt5_use_modules(rtk_agri Widgets)
 
 ###
 # grouping files for visual studio or xcode
 ###
+
+set(sources ${sources} app/str2str/str2str.c ${src_rtk_agri})
 
 SET(dirlist "")
 FOREACH(file_path ${sources})
