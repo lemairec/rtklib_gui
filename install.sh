@@ -1,4 +1,4 @@
-sudo apt-get install buildessential cmake qt5
+sudo apt-get install build-essential cmake libqt5webkit5-dev
 mkdir build
 cd build
 cmake ..

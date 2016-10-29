@@ -1,4 +1,5 @@
 #include "mainwindow.hpp"
+#include "optionsbasertk.hpp"
 
 MainWindow::MainWindow(QWidget *parent)
     :QMainWindow(parent)
@@ -7,7 +8,9 @@ MainWindow::MainWindow(QWidget *parent)
     retranslateUi();
     
     QObject::connect(QuitterButton,SIGNAL(clicked()),qApp,SLOT(quit()));
-    QObject::connect(RoverButton,SIGNAL(clicked()),this,SLOT(OuvreRover()));
+    QObject::connect(RoverButton,SIGNAL(clicked()),this,SLOT(OuvreOptionsRover()));
+    
+    QObject::connect(BasestationButton,SIGNAL(clicked()),this,SLOT(OuvreOptionsBaseRtk()));
 }
 
 MainWindow::~MainWindow()
@@ -66,4 +69,16 @@ void MainWindow::retranslateUi()
     ensgIconlabel->setText(QString());
     HelpButton->setText(QApplication::translate("MainWindow", "HELP", 0, QApplication::UnicodeUTF8));
     PowerOFFButton->setText(QApplication::translate("MainWindow", "POWER OFF", 0, QApplication::UnicodeUTF8));*/
+}
+
+void MainWindow::OuvreOptionsRover(){
+
+}
+void MainWindow::OuvreOptionsBaseRtk(){
+    OptionsBaseRtk options;
+    
+    //options.setModal(true);
+    //options.setWindowFlags(Qt::FramelessWindowHint);
+    
+    options.exec();
 }

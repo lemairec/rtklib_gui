@@ -1,5 +1,5 @@
-#include "include_qt.hpp"
-#include "mainwindow.hpp"
+#include "qt/include_qt.hpp"
+#include "qt/mainwindow.hpp"
 #include "rtklib.h"
 
 int main(int argc, char *argv[])

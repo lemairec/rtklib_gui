@@ -12,6 +12,11 @@ public:
     explicit MainWindow(QWidget *parent = 0);
     ~MainWindow();
     
+public slots:
+    void OuvreOptionsBaseRtk();
+    void OuvreOptionsRover();
+
+private:
     void setupUi();
     void retranslateUi();
 };

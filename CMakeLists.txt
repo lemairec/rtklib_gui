@@ -10,8 +10,8 @@ set(sources ${rtklib_c})
 #add_executable(str2str ${sources} app/str2str/str2str.c)
 
 
-set(rtk_agri_hpp app/rtk_agri/mainwindow.hpp app/rtk_agri/include_qt.hpp)
-set(rtk_agri_cpp app/rtk_agri/rtk_agri.cpp app/rtk_agri/mainwindow.cpp)
+set(rtk_agri_hpp app/rtk_agri/qt/mainwindow.hpp app/rtk_agri/qt/include_qt.hpp app/rtk_agri/qt/optionsbasertk.hpp)
+set(rtk_agri_cpp app/rtk_agri/rtk_agri.cpp app/rtk_agri/qt/mainwindow.cpp app/rtk_agri/qt/optionsbasertk.cpp)
 set(src_rtk_agri ${rtk_agri_hpp} ${rtk_agri_cpp})
 
 SET(CMAKE_INCLUDE_CURRENT_DIR ON)
