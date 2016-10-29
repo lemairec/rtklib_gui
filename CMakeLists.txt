@@ -4,11 +4,13 @@ project(rtklib_gui)
 file(GLOB_RECURSE    rtklib_c      lib/*.c)
 include_directories(lib)
 
+FIND_PACKAGE(Threads)
 
 set(sources ${rtklib_c})
+set (CMAKE_EXE_LINKER_FLAGS -lm)
 
-#add_executable(str2str ${sources} app/str2str/str2str.c)
-
+add_executable(str2str ${sources} app/str2str/str2str.c)
+target_link_libraries(str2str ${CMAKE_THREAD_LIBS_INIT})
 
 set(rtk_agri_hpp app/rtk_agri/qt/mainwindow.hpp app/rtk_agri/qt/include_qt.hpp app/rtk_agri/qt/optionsbasertk.hpp)
 set(rtk_agri_cpp app/rtk_agri/rtk_agri.cpp app/rtk_agri/qt/mainwindow.cpp app/rtk_agri/qt/optionsbasertk.cpp)
@@ -18,7 +20,6 @@ SET(CMAKE_INCLUDE_CURRENT_DIR ON)
 ADD_DEFINITIONS(-g -ggdb)
 set(CMAKE_AUTOMOC ON)
 FIND_PACKAGE(Qt5Core)
-FIND_PACKAGE(Threads)
 add_executable(rtk_agri ${sources} ${src_rtk_agri})
 qt5_use_modules(rtk_agri Widgets)
 target_link_libraries(rtk_agri ${CMAKE_THREAD_LIBS_INIT})
