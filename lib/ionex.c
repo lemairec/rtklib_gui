@@ -1,7 +1,7 @@
 /*------------------------------------------------------------------------------
 * ionex.c : ionex functions
 *
-*          Copyright (C) 2011 by T.TAKASU, All rights reserved.
+*          Copyright (C) 2011-2013 by T.TAKASU, All rights reserved.
 *
 * references:
 *     [1] S.Schear, W.Gurtner and J.Feltens, IONEX: The IONosphere Map EXchange
@@ -12,6 +12,9 @@
 *
 * version : $Revision:$ $Date:$
 * history : 2011/03/29 1.0 new
+*           2013/03/05 1.1 change api readtec()
+*                          fix problem in case of lat>85deg or lat<-85deg
+*           2014/02/22 1.2 fix problem on compiled as C++
 *-----------------------------------------------------------------------------*/
 #include "rtklib.h"
 
@@ -76,8 +79,8 @@ static tec_t *addtec(const double *lats, const double *lons, const double *hgts,
     }
     n=ndata[0]*ndata[1]*ndata[2];
     
-    if (!(p->data=malloc(sizeof(double)*n))||
-        !(p->rms =malloc(sizeof(float )*n))) {
+    if (!(p->data=(double *)malloc(sizeof(double)*n))||
+        !(p->rms =(float  *)malloc(sizeof(float )*n))) {
         return NULL;
     }
     for (i=0;i<n;i++) {
@@ -330,6 +333,7 @@ static int interptec(const tec_t *tec, int k, const double *posp, double *value,
     int i,j,n,index;
     
     trace(3,"interptec: k=%d posp=%.2f %.2f\n",k,posp[0]*R2D,posp[1]*R2D);
+    *value=*rms=0.0;
     
     if (tec->lats[2]==0.0||tec->lons[2]==0.0) return 0;
     
@@ -360,8 +364,12 @@ static int interptec(const tec_t *tec, int k, const double *posp, double *value,
     else if (a> 0.5&&b<=0.5&&d[1]>0.0) {*value=d[1]; *rms=r[1];}
     else if (a<=0.5&&b> 0.5&&d[2]>0.0) {*value=d[2]; *rms=r[2];}
     else if (a> 0.5&&b> 0.5&&d[3]>0.0) {*value=d[3]; *rms=r[3];}
-    else return 0;
-    
+    else {
+        i=0;
+        for (n=0;n<4;n++) if (d[n]>0.0) {i++; *value+=d[n]; *rms+=r[n];}
+        if(i==0) return 0;
+        *value/=i; *rms/=i;
+    }
     return 1;
 }
 /* ionosphere delay by tec grid data -----------------------------------------*/

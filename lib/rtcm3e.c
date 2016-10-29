@@ -1,7 +1,10 @@
 /*------------------------------------------------------------------------------
 * rtcm3e.c : rtcm ver.3 message encoder functions
 *
-*          Copyright (C) 2012-2013 by T.TAKASU, All rights reserved.
+*          Copyright (C) 2012-2015 by T.TAKASU, All rights reserved.
+*
+* options :
+*     -DSSR_QZSS_DRAFT_V05: qzss ssr messages based on ref [16]
 *
 * references :
 *     see rtcm.c
@@ -14,6 +17,23 @@
 *                           fix bug on carrier-phase in 1001-1004,1009-1012
 *           2012/12/28 1.3  fix bug on compass carrier wave length
 *           2013/01/18 1.4  fix bug on ssr message generation
+*           2013/05/11 1.5  change type of arg value of setbig()
+*           2013/05/19 1.5  gpst -> bdt of time-tag in beidou msm message
+*           2013/04/27 1.7  comply with rtcm 3.2 with amendment 1/2 (ref[15])
+*                           delete MT 1046 according to ref [15]
+*           2014/05/15 1.8  set NT field in MT 1020 glonass ephemeris
+*           2014/12/06 1.9  support SBAS/BeiDou SSR messages (ref [16])
+*                           fix bug on invalid staid in qzss ssr messages
+*           2015/03/22 1.9  add handling of iodcrc for beidou/sbas ssr messages
+*           2015/08/03 1.10 fix bug on wrong udint and iod in ssr 7.
+*                           support rtcm ssr fcb message mt 2065-2069.
+*           2015/09/07 1.11 add message count of MT 2000-2099
+*           2015/10/21 1.12 add MT1046 support for IGS MGEX
+*           2015/12/04 1.13 add MT63 beidou ephemeris (rtcm draft)
+*                           fix bug on msm message generation of beidou
+*                           fix bug on ssr 3 message generation (#321)
+*           2016/06/12 1.14 fix bug on segmentation fault by generating msm1
+*           2016/09/20 1.15 fix bug on MT1045 Galileo week rollover
 *-----------------------------------------------------------------------------*/
 #include "rtklib.h"
 
@@ -28,6 +48,7 @@ static const char rcsid[]="$Id:$";
 #define P2_34       5.820766091346740E-11 /* 2^-34 */
 #define P2_46       1.421085471520200E-14 /* 2^-46 */
 #define P2_59       1.734723475976810E-18 /* 2^-59 */
+#define P2_66       1.355252715606880E-20 /* 2^-66 */
 
 #define ROUND(x)    ((int)floor((x)+0.5))
 #define ROUND_U(x)  ((unsigned int)floor((x)+0.5))
@@ -46,10 +67,10 @@ static const double ssrudint[16]={
     1,2,5,10,15,30,60,120,240,300,600,900,1800,3600,7200,10800
 };
 /* set sign-magnitude bits ---------------------------------------------------*/
-static void setbitg(unsigned char *buff, int pos, int len, double value)
+static void setbitg(unsigned char *buff, int pos, int len, int value)
 {
     setbitu(buff,pos,1,value<0?1:0);
-    setbitu(buff,pos+1,len-1,fabs(value));
+    setbitu(buff,pos+1,len-1,value<0?-value:value);
 }
 /* set signed 38 bit field ---------------------------------------------------*/
 static void set38bits(unsigned char *buff, int pos, double value)
@@ -172,8 +193,8 @@ static int to_code1_glo(unsigned char code)
 static int to_code2_glo(unsigned char code)
 {
     switch (code) {
-        case CODE_L2C: return 0; /* L1 C/A */
-        case CODE_L2P: return 1; /* L1 P */
+        case CODE_L2C: return 0; /* L2 C/A */
+        case CODE_L2P: return 1; /* L2 P */
     }
     return 0;
 }
@@ -192,7 +213,7 @@ static void gen_obs_gps(rtcm_t *rtcm, const obsd_t *data, int *code1, int *pr1,
     
     lam1=CLIGHT/FREQ1;
     lam2=CLIGHT/FREQ2;
-    *pr1=*amb=0.0;
+    *pr1=*amb=0;
     if (ppr1) *ppr1=0xFFF80000; /* invalid values */
     if (pr21) *pr21=0xFFFFE000;
     if (ppr2) *ppr2=0xFFF80000;
@@ -240,7 +261,7 @@ static void gen_obs_glo(rtcm_t *rtcm, const obsd_t *data, int fcn, int *code1,
         lam1=CLIGHT/(FREQ1_GLO+DFRQ1_GLO*(fcn-7));
         lam2=CLIGHT/(FREQ2_GLO+DFRQ2_GLO*(fcn-7));
     }
-    *pr1=*amb=0.0;
+    *pr1=*amb=0;
     if (ppr1) *ppr1=0xFFF80000; /* invalid values */
     if (pr21) *pr21=0xFFFFE000;
     if (ppr2) *ppr2=0xFFF80000;
@@ -780,7 +801,7 @@ static int encode_type1019(rtcm_t *rtcm, int sync)
     setbits(rtcm->buff,i, 8,tgd      ); i+= 8;
     setbitu(rtcm->buff,i, 6,eph->svh ); i+= 6;
     setbitu(rtcm->buff,i, 1,eph->flag); i+= 1;
-    setbitu(rtcm->buff,i, 1,eph->fit ); i+= 1;
+    setbitu(rtcm->buff,i, 1,eph->fit>0.0?0:1); i+=1;
     rtcm->nbit=i;
     return 1;
 }
@@ -788,9 +809,10 @@ static int encode_type1019(rtcm_t *rtcm, int sync)
 static int encode_type1020(rtcm_t *rtcm, int sync)
 {
     geph_t *geph;
+    gtime_t time;
     double ep[6];
-    int i=24,j,prn,tk_h,tk_m,tk_s,tb,pos[3],vel[3],acc[3],gamn,taun;
-    int fcn;
+    int i=24,j,prn,tk_h,tk_m,tk_s,tb,pos[3],vel[3],acc[3],gamn,taun,dtaun;
+    int fcn,NT;
     
     trace(3,"encode_type1020: sync=%d\n",sync);
     
@@ -800,13 +822,20 @@ static int encode_type1020(rtcm_t *rtcm, int sync)
     fcn=geph->frq+7;
     
     /* time of frame within day (utc(su) + 3 hr) */
-    time2epoch(timeadd(gpst2utc(geph->tof),10800.0),ep);
+    time=timeadd(gpst2utc(geph->tof),10800.0);
+    time2epoch(time,ep);
     tk_h=(int)ep[3];
     tk_m=(int)ep[4];
     tk_s=ROUND(ep[5]/30.0);
     
+    /* # of days since jan 1 in leap year */
+    ep[0]=floor(ep[0]/4.0)*4.0; ep[1]=ep[2]=1.0;
+    ep[3]=ep[4]=ep[5]=0.0;
+    NT=(int)floor(timediff(time,epoch2time(ep))/86400.+1.0);
+    
     /* index of time interval within day (utc(su) + 3 hr) */
-    time2epoch(timeadd(gpst2utc(geph->toe),10800.0),ep);
+    time=timeadd(gpst2utc(geph->toe),10800.0);
+    time2epoch(time,ep);
     tb=ROUND((ep[3]*3600.0+ep[4]*60.0+ep[5])/900.0);
     
     for (j=0;j<3;j++) {
@@ -814,18 +843,19 @@ static int encode_type1020(rtcm_t *rtcm, int sync)
         vel[j]=ROUND(geph->vel[j]/P2_20/1E3);
         acc[j]=ROUND(geph->acc[j]/P2_30/1E3);
     }
-    gamn=ROUND(geph->gamn/P2_40);
-    taun=ROUND(geph->taun/P2_30);
+    gamn =ROUND(geph->gamn /P2_40);
+    taun =ROUND(geph->taun /P2_30);
+    dtaun=ROUND(geph->dtaun/P2_30);
     
     setbitu(rtcm->buff,i,12,1020     ); i+=12;
     setbitu(rtcm->buff,i, 6,prn      ); i+= 6;
     setbitu(rtcm->buff,i, 5,fcn      ); i+= 5;
-    setbitu(rtcm->buff,i, 4,0        ); i+= 4;
+    setbitu(rtcm->buff,i, 4,0        ); i+= 4; /* almanac health,P1 */
     setbitu(rtcm->buff,i, 5,tk_h     ); i+= 5;
     setbitu(rtcm->buff,i, 6,tk_m     ); i+= 6;
     setbitu(rtcm->buff,i, 1,tk_s     ); i+= 1;
-    setbitu(rtcm->buff,i, 1,geph->svh); i+= 1;
-    setbitu(rtcm->buff,i, 1,0        ); i+= 1;
+    setbitu(rtcm->buff,i, 1,geph->svh); i+= 1; /* Bn */
+    setbitu(rtcm->buff,i, 1,0        ); i+= 1; /* P2 */
     setbitu(rtcm->buff,i, 7,tb       ); i+= 7;
     setbitg(rtcm->buff,i,24,vel[0]   ); i+=24;
     setbitg(rtcm->buff,i,27,pos[0]   ); i+=27;
@@ -836,22 +866,22 @@ static int encode_type1020(rtcm_t *rtcm, int sync)
     setbitg(rtcm->buff,i,24,vel[2]   ); i+=24;
     setbitg(rtcm->buff,i,27,pos[2]   ); i+=27;
     setbitg(rtcm->buff,i, 5,acc[2]   ); i+= 5;
-    setbitu(rtcm->buff,i, 1,0        ); i+= 1;
+    setbitu(rtcm->buff,i, 1,0        ); i+= 1; /* P3 */
     setbitg(rtcm->buff,i,11,gamn     ); i+=11;
-    setbitu(rtcm->buff,i, 3,0        ); i+= 3;
+    setbitu(rtcm->buff,i, 3,0        ); i+= 3; /* P,ln */
     setbitg(rtcm->buff,i,22,taun     ); i+=22;
-    setbitu(rtcm->buff,i, 5,0        ); i+= 5;
-    setbitu(rtcm->buff,i, 5,0        ); i+= 5;
-    setbitu(rtcm->buff,i, 1,0        ); i+= 1;
-    setbitu(rtcm->buff,i, 4,0        ); i+= 4;
-    setbitu(rtcm->buff,i,11,0        ); i+=11;
-    setbitu(rtcm->buff,i, 2,0        ); i+= 2;
-    setbitu(rtcm->buff,i, 1,0        ); i+= 1;
-    setbitu(rtcm->buff,i,11,0        ); i+=11;
-    setbitu(rtcm->buff,i,32,0        ); i+=32;
-    setbitu(rtcm->buff,i, 5,0        ); i+= 5;
-    setbitu(rtcm->buff,i,22,0        ); i+=22;
-    setbitu(rtcm->buff,i, 1,0        ); i+= 1;
+    setbitu(rtcm->buff,i, 5,dtaun    ); i+= 5;
+    setbitu(rtcm->buff,i, 5,geph->age); i+= 5; /* En */
+    setbitu(rtcm->buff,i, 1,0        ); i+= 1; /* P4 */
+    setbitu(rtcm->buff,i, 4,0        ); i+= 4; /* FT */
+    setbitu(rtcm->buff,i,11,NT       ); i+=11;
+    setbitu(rtcm->buff,i, 2,0        ); i+= 2; /* M */
+    setbitu(rtcm->buff,i, 1,0        ); i+= 1; /* flag for addtional data */
+    setbitu(rtcm->buff,i,11,0        ); i+=11; /* NA */
+    setbitu(rtcm->buff,i,32,0        ); i+=32; /* tauc */
+    setbitu(rtcm->buff,i, 5,0        ); i+= 5; /* N4 */
+    setbitu(rtcm->buff,i,22,0        ); i+=22; /* taugps */
+    setbitu(rtcm->buff,i, 1,0        ); i+= 1; /* ln */
     setbitu(rtcm->buff,i, 7,0        ); i+= 7;
     rtcm->nbit=i;
     return 1;
@@ -896,12 +926,12 @@ static int encode_type1033(rtcm_t *rtcm, int sync)
     rtcm->nbit=i;
     return 1;
 }
-/* encode type 1044: qzss ephemerides ----------------------------------------*/
+/* encode type 1044: qzss ephemerides (ref [15]) -----------------------------*/
 static int encode_type1044(rtcm_t *rtcm, int sync)
 {
     eph_t *eph;
     unsigned int sqrtA,e;
-    int i=24,prn,week,toe,toc,ttr,i0,OMG0,omg,M0,deln,idot,OMGd,crs,crc;
+    int i=24,prn,week,toe,toc,i0,OMG0,omg,M0,deln,idot,OMGd,crs,crc;
     int cus,cuc,cis,cic,af0,af1,af2,tgd;
     
     trace(3,"encode_type1044: sync=%d\n",sync);
@@ -912,7 +942,6 @@ static int encode_type1044(rtcm_t *rtcm, int sync)
     week=eph->week%1024;
     toe  =ROUND(eph->toes/16.0);
     toc  =ROUND(time2gpst(eph->toc,NULL)/16.0);
-    ttr  =ROUND(time2gpst(eph->ttr,NULL));
     sqrtA=ROUND_U(sqrt(eph->A)/P2_19);
     e    =ROUND_U(eph->e/P2_33);
     i0   =ROUND(eph->i0  /P2_31/SC2RAD);
@@ -962,28 +991,26 @@ static int encode_type1044(rtcm_t *rtcm, int sync)
     setbitu(rtcm->buff,i, 6,eph->svh ); i+= 6;
     setbits(rtcm->buff,i, 8,tgd      ); i+= 8;
     setbitu(rtcm->buff,i,10,eph->iodc); i+=10;
-    setbitu(rtcm->buff,i,20,ttr      ); i+=20;
-    setbitu(rtcm->buff,i, 1,eph->fit ); i+= 1;
+    setbitu(rtcm->buff,i, 1,eph->fit==2.0?0:1); i+=1;
     rtcm->nbit=i;
     return 1;
 }
-/* encode galileo ephemerides ------------------------------------------------*/
-static int encode_eph_gal(int type, rtcm_t *rtcm, int sync)
+/* encode type 1045: galileo satellite ephemerides (ref [15]) ----------------*/
+static int encode_type1045(rtcm_t *rtcm, int sync)
 {
     eph_t *eph;
     unsigned int sqrtA,e;
-    int i=24,prn,week,toe,toc,ttr,i0,OMG0,omg,M0,deln,idot,OMGd,crs,crc;
+    int i=24,prn,week,toe,toc,i0,OMG0,omg,M0,deln,idot,OMGd,crs,crc;
     int cus,cuc,cis,cic,af0,af1,af2,bgd1,bgd2,oshs,osdvs;
     
-    trace(3,"encode_eph_gal: type=%d sync=%d\n",type,sync);
+    trace(3,"encode_type1045: sync=%d\n",sync);
     
     if (satsys(rtcm->ephsat,&prn)!=SYS_GAL) return 0;
     eph=rtcm->nav.eph+rtcm->ephsat-1;
     if (eph->sat!=rtcm->ephsat) return 0;
-    week=eph->week%4092;
+    week=eph->week%4096;
     toe  =ROUND(eph->toes/60.0);
     toc  =ROUND(time2gpst(eph->toc,NULL)/60.0);
-    ttr  =ROUND(time2gpst(eph->ttr,NULL));
     sqrtA=ROUND_U(sqrt(eph->A)/P2_19);
     e    =ROUND_U(eph->e/P2_33);
     i0   =ROUND(eph->i0  /P2_31/SC2RAD);
@@ -1004,20 +1031,9 @@ static int encode_eph_gal(int type, rtcm_t *rtcm, int sync)
     af2  =ROUND(eph->f2 /P2_59);
     bgd1 =ROUND(eph->tgd[0]/P2_32); /* E5a/E1 */
     bgd2 =ROUND(eph->tgd[1]/P2_32); /* E5b/E1 */
-    
-    if (type==1045) { /* f/nav */
-        if (!(eph->code&2)) return 0;
-        oshs =(eph->svh>>4)&3;
-        osdvs=(eph->svh>>3)&1;
-    }
-    else if (type==1046) { /* i/nav */
-        if (!(eph->code&5)) return 0;
-        oshs =(eph->svh>>1)&3;
-        osdvs=eph->svh&1;
-    }
-    else return 0;
-    
-    setbitu(rtcm->buff,i,12,type     ); i+=12;
+    oshs =(eph->svh>>4)&3;
+    osdvs=(eph->svh>>3)&1;
+    setbitu(rtcm->buff,i,12,1045     ); i+=12;
     setbitu(rtcm->buff,i, 6,prn      ); i+= 6;
     setbitu(rtcm->buff,i,12,week     ); i+=12;
     setbitu(rtcm->buff,i,10,eph->iode); i+=10;
@@ -1043,34 +1059,220 @@ static int encode_eph_gal(int type, rtcm_t *rtcm, int sync)
     setbits(rtcm->buff,i,32,omg      ); i+=32;
     setbits(rtcm->buff,i,24,OMGd     ); i+=24;
     setbits(rtcm->buff,i,10,bgd1     ); i+=10;
-    if (type==1046) {
-        setbits(rtcm->buff,i,10,bgd2 ); i+=10;
-    }
     setbitu(rtcm->buff,i, 2,oshs     ); i+= 2;
     setbitu(rtcm->buff,i, 1,osdvs    ); i+= 1;
-    setbitu(rtcm->buff,i,20,ttr      ); i+=20;
-    if (type==1045) {
-        setbitu(rtcm->buff,i, 3,0    ); i+= 3; /* reserved */
-    }
-    else {
-        setbitu(rtcm->buff,i, 1,0    ); i+= 1; /* reserved */
-    }
+    setbitu(rtcm->buff,i, 7,0        ); i+= 7; /* reserved */
     rtcm->nbit=i;
     return 1;
 }
-/* encode type 1045: galileo f/nav satellite ephemerides ---------------------*/
-static int encode_type1045(rtcm_t *rtcm, int sync)
-{
-    trace(3,"encode_type1045: sync=%d\n",sync);
-    
-    return encode_eph_gal(1045,rtcm,sync);
-}
-/* encode type 1046: galileo i/nav satellite ephemerides ---------------------*/
+/* encode type 1046: galileo satellite ephemerides (extension for IGS MGEX) --*/
 static int encode_type1046(rtcm_t *rtcm, int sync)
 {
+    eph_t *eph;
+    unsigned int sqrtA,e;
+    int i=24,prn,week,toe,toc,i0,OMG0,omg,M0,deln,idot,OMGd,crs,crc;
+    int cus,cuc,cis,cic,af0,af1,af2,bgd1,bgd2,oshs,osdvs;
+    
     trace(3,"encode_type1046: sync=%d\n",sync);
     
-    return encode_eph_gal(1046,rtcm,sync);
+    if (satsys(rtcm->ephsat,&prn)!=SYS_GAL) return 0;
+    eph=rtcm->nav.eph+rtcm->ephsat-1;
+    if (eph->sat!=rtcm->ephsat) return 0;
+    week=eph->week%4096;
+    toe  =ROUND(eph->toes/60.0);
+    toc  =ROUND(time2gpst(eph->toc,NULL)/60.0);
+    sqrtA=ROUND_U(sqrt(eph->A)/P2_19);
+    e    =ROUND_U(eph->e/P2_33);
+    i0   =ROUND(eph->i0  /P2_31/SC2RAD);
+    OMG0 =ROUND(eph->OMG0/P2_31/SC2RAD);
+    omg  =ROUND(eph->omg /P2_31/SC2RAD);
+    M0   =ROUND(eph->M0  /P2_31/SC2RAD);
+    deln =ROUND(eph->deln/P2_43/SC2RAD);
+    idot =ROUND(eph->idot/P2_43/SC2RAD);
+    OMGd =ROUND(eph->OMGd/P2_43/SC2RAD);
+    crs  =ROUND(eph->crs/P2_5 );
+    crc  =ROUND(eph->crc/P2_5 );
+    cus  =ROUND(eph->cus/P2_29);
+    cuc  =ROUND(eph->cuc/P2_29);
+    cis  =ROUND(eph->cis/P2_29);
+    cic  =ROUND(eph->cic/P2_29);
+    af0  =ROUND(eph->f0 /P2_34);
+    af1  =ROUND(eph->f1 /P2_46);
+    af2  =ROUND(eph->f2 /P2_59);
+    bgd1 =ROUND(eph->tgd[0]/P2_32); /* E5a/E1 */
+    bgd2 =ROUND(eph->tgd[1]/P2_32); /* E5b/E1 */
+    oshs =(eph->svh>>4)&3;
+    osdvs=(eph->svh>>3)&1;
+    setbitu(rtcm->buff,i,12,1046     ); i+=12;
+    setbitu(rtcm->buff,i, 6,prn      ); i+= 6;
+    setbitu(rtcm->buff,i,12,week     ); i+=12;
+    setbitu(rtcm->buff,i,10,eph->iode); i+=10;
+    setbitu(rtcm->buff,i, 8,eph->sva ); i+= 8;
+    setbits(rtcm->buff,i,14,idot     ); i+=14;
+    setbitu(rtcm->buff,i,14,toc      ); i+=14;
+    setbits(rtcm->buff,i, 6,af2      ); i+= 6;
+    setbits(rtcm->buff,i,21,af1      ); i+=21;
+    setbits(rtcm->buff,i,31,af0      ); i+=31;
+    setbits(rtcm->buff,i,16,crs      ); i+=16;
+    setbits(rtcm->buff,i,16,deln     ); i+=16;
+    setbits(rtcm->buff,i,32,M0       ); i+=32;
+    setbits(rtcm->buff,i,16,cuc      ); i+=16;
+    setbitu(rtcm->buff,i,32,e        ); i+=32;
+    setbits(rtcm->buff,i,16,cus      ); i+=16;
+    setbitu(rtcm->buff,i,32,sqrtA    ); i+=32;
+    setbitu(rtcm->buff,i,14,toe      ); i+=14;
+    setbits(rtcm->buff,i,16,cic      ); i+=16;
+    setbits(rtcm->buff,i,32,OMG0     ); i+=32;
+    setbits(rtcm->buff,i,16,cis      ); i+=16;
+    setbits(rtcm->buff,i,32,i0       ); i+=32;
+    setbits(rtcm->buff,i,16,crc      ); i+=16;
+    setbits(rtcm->buff,i,32,omg      ); i+=32;
+    setbits(rtcm->buff,i,24,OMGd     ); i+=24;
+    setbits(rtcm->buff,i,10,bgd1     ); i+=10;
+    setbitu(rtcm->buff,i, 2,oshs     ); i+= 2;
+    setbitu(rtcm->buff,i, 1,osdvs    ); i+= 1;
+    setbitu(rtcm->buff,i, 7,0        ); i+= 7; /* reserved */
+    rtcm->nbit=i;
+    return 1;
+}
+/* encode type 1047: beidou ephemerides (tentative mt and format) ------------*/
+static int encode_type1047(rtcm_t *rtcm, int sync)
+{
+    eph_t *eph;
+    unsigned int sqrtA,e;
+    int i=24,prn,week,toe,toc,i0,OMG0,omg,M0,deln,idot,OMGd,crs,crc;
+    int cus,cuc,cis,cic,af0,af1,af2,tgd;
+    
+    trace(3,"encode_type1047: sync=%d\n",sync);
+    
+    if (satsys(rtcm->ephsat,&prn)!=SYS_CMP) return 0;
+    eph=rtcm->nav.eph+rtcm->ephsat-1;
+    if (eph->sat!=rtcm->ephsat) return 0;
+    week =eph->week%1024;
+    toe  =ROUND(eph->toes/16.0);
+    toc  =ROUND(time2bdt(gpst2bdt(eph->toc),NULL)/16.0); /* gpst -> bdt */
+    sqrtA=ROUND_U(sqrt(eph->A)/P2_19);
+    e    =ROUND_U(eph->e/P2_33);
+    i0   =ROUND(eph->i0  /P2_31/SC2RAD);
+    OMG0 =ROUND(eph->OMG0/P2_31/SC2RAD);
+    omg  =ROUND(eph->omg /P2_31/SC2RAD);
+    M0   =ROUND(eph->M0  /P2_31/SC2RAD);
+    deln =ROUND(eph->deln/P2_43/SC2RAD);
+    idot =ROUND(eph->idot/P2_43/SC2RAD);
+    OMGd =ROUND(eph->OMGd/P2_43/SC2RAD);
+    crs  =ROUND(eph->crs/P2_5 );
+    crc  =ROUND(eph->crc/P2_5 );
+    cus  =ROUND(eph->cus/P2_29);
+    cuc  =ROUND(eph->cuc/P2_29);
+    cis  =ROUND(eph->cis/P2_29);
+    cic  =ROUND(eph->cic/P2_29);
+    af0  =ROUND(eph->f0 /P2_31);
+    af1  =ROUND(eph->f1 /P2_43);
+    af2  =ROUND(eph->f2 /P2_55);
+    tgd  =ROUND(eph->tgd[0]/P2_31);
+    
+    setbitu(rtcm->buff,i,12,1047     ); i+=12;
+    setbitu(rtcm->buff,i, 6,prn      ); i+= 6;
+    setbitu(rtcm->buff,i,10,week     ); i+=10;
+    setbitu(rtcm->buff,i, 4,eph->sva ); i+= 4;
+    setbitu(rtcm->buff,i, 2,eph->code); i+= 2;
+    setbits(rtcm->buff,i,14,idot     ); i+=14;
+    setbitu(rtcm->buff,i, 8,eph->iode); i+= 8;
+    setbitu(rtcm->buff,i,16,toc      ); i+=16;
+    setbits(rtcm->buff,i, 8,af2      ); i+= 8;
+    setbits(rtcm->buff,i,16,af1      ); i+=16;
+    setbits(rtcm->buff,i,22,af0      ); i+=22;
+    setbitu(rtcm->buff,i,10,eph->iodc); i+=10;
+    setbits(rtcm->buff,i,16,crs      ); i+=16;
+    setbits(rtcm->buff,i,16,deln     ); i+=16;
+    setbits(rtcm->buff,i,32,M0       ); i+=32;
+    setbits(rtcm->buff,i,16,cuc      ); i+=16;
+    setbitu(rtcm->buff,i,32,e        ); i+=32;
+    setbits(rtcm->buff,i,16,cus      ); i+=16;
+    setbitu(rtcm->buff,i,32,sqrtA    ); i+=32;
+    setbitu(rtcm->buff,i,16,toe      ); i+=16;
+    setbits(rtcm->buff,i,16,cic      ); i+=16;
+    setbits(rtcm->buff,i,32,OMG0     ); i+=32;
+    setbits(rtcm->buff,i,16,cis      ); i+=16;
+    setbits(rtcm->buff,i,32,i0       ); i+=32;
+    setbits(rtcm->buff,i,16,crc      ); i+=16;
+    setbits(rtcm->buff,i,32,omg      ); i+=32;
+    setbits(rtcm->buff,i,24,OMGd     ); i+=24;
+    setbits(rtcm->buff,i, 8,tgd      ); i+= 8;
+    setbitu(rtcm->buff,i, 6,eph->svh ); i+= 6;
+    setbitu(rtcm->buff,i, 1,eph->flag); i+= 1;
+    setbitu(rtcm->buff,i, 1,eph->fit>0.0?0:1); i+=1;
+    rtcm->nbit=i;
+    return 1;
+}
+/* encode type 63: beidou ephemerides (rtcm draft) ---------------------------*/
+static int encode_type63(rtcm_t *rtcm, int sync)
+{
+    eph_t *eph;
+    unsigned int sqrtA,e;
+    int i=24,prn,week,toe,toc,i0,OMG0,omg,M0,deln,idot,OMGd,crs,crc;
+    int cus,cuc,cis,cic,af0,af1,af2,tgd1,tgd2;
+    
+    trace(3,"encode_type63: sync=%d\n",sync);
+    
+    if (satsys(rtcm->ephsat,&prn)!=SYS_CMP) return 0;
+    eph=rtcm->nav.eph+rtcm->ephsat-1;
+    if (eph->sat!=rtcm->ephsat) return 0;
+    week =eph->week%8192;
+    toe  =ROUND(eph->toes/8.0);
+    toc  =ROUND(time2bdt(gpst2bdt(eph->toc),NULL)/8.0); /* gpst -> bdt */
+    sqrtA=ROUND_U(sqrt(eph->A)/P2_19);
+    e    =ROUND_U(eph->e/P2_33);
+    i0   =ROUND(eph->i0  /P2_31/SC2RAD);
+    OMG0 =ROUND(eph->OMG0/P2_31/SC2RAD);
+    omg  =ROUND(eph->omg /P2_31/SC2RAD);
+    M0   =ROUND(eph->M0  /P2_31/SC2RAD);
+    deln =ROUND(eph->deln/P2_43/SC2RAD);
+    idot =ROUND(eph->idot/P2_43/SC2RAD);
+    OMGd =ROUND(eph->OMGd/P2_43/SC2RAD);
+    crs  =ROUND(eph->crs/P2_6 );
+    crc  =ROUND(eph->crc/P2_6 );
+    cus  =ROUND(eph->cus/P2_31);
+    cuc  =ROUND(eph->cuc/P2_31);
+    cis  =ROUND(eph->cis/P2_31);
+    cic  =ROUND(eph->cic/P2_31);
+    af0  =ROUND(eph->f0 /P2_33);
+    af1  =ROUND(eph->f1 /P2_50);
+    af2  =ROUND(eph->f2 /P2_66);
+    tgd1 =ROUND(eph->tgd[0]/1E-10);
+    tgd2 =ROUND(eph->tgd[1]/1E-10);
+    
+    setbitu(rtcm->buff,i,12,63       ); i+=12;
+    setbitu(rtcm->buff,i, 6,prn      ); i+= 6;
+    setbitu(rtcm->buff,i,13,week     ); i+=13;
+    setbitu(rtcm->buff,i, 4,eph->sva ); i+= 4;
+    setbits(rtcm->buff,i,14,idot     ); i+=14;
+    setbitu(rtcm->buff,i, 5,eph->iode); i+= 5;
+    setbitu(rtcm->buff,i,17,toc      ); i+=17;
+    setbits(rtcm->buff,i,11,af2      ); i+=11;
+    setbits(rtcm->buff,i,22,af1      ); i+=22;
+    setbits(rtcm->buff,i,24,af0      ); i+=24;
+    setbitu(rtcm->buff,i, 5,eph->iodc); i+= 5;
+    setbits(rtcm->buff,i,18,crs      ); i+=18;
+    setbits(rtcm->buff,i,16,deln     ); i+=16;
+    setbits(rtcm->buff,i,32,M0       ); i+=32;
+    setbits(rtcm->buff,i,18,cuc      ); i+=18;
+    setbitu(rtcm->buff,i,32,e        ); i+=32;
+    setbits(rtcm->buff,i,18,cus      ); i+=18;
+    setbitu(rtcm->buff,i,32,sqrtA    ); i+=32;
+    setbitu(rtcm->buff,i,17,toe      ); i+=17;
+    setbits(rtcm->buff,i,18,cic      ); i+=18;
+    setbits(rtcm->buff,i,32,OMG0     ); i+=32;
+    setbits(rtcm->buff,i,18,cis      ); i+=18;
+    setbits(rtcm->buff,i,32,i0       ); i+=32;
+    setbits(rtcm->buff,i,18,crc      ); i+=18;
+    setbits(rtcm->buff,i,32,omg      ); i+=32;
+    setbits(rtcm->buff,i,24,OMGd     ); i+=24;
+    setbits(rtcm->buff,i,10,tgd1     ); i+=10;
+    setbits(rtcm->buff,i,10,tgd2     ); i+=10;
+    setbitu(rtcm->buff,i, 1,eph->svh ); i+= 1;
+    rtcm->nbit=i;
+    return 1;
 }
 /* encode ssr header ---------------------------------------------------------*/
 static int encode_ssr_head(int type, rtcm_t *rtcm, int sys, int nsat, int sync,
@@ -1078,16 +1280,21 @@ static int encode_ssr_head(int type, rtcm_t *rtcm, int sys, int nsat, int sync,
                            int solid)
 {
     double tow;
-    int i=24,np,msgno,epoch,week,udi;
+    int i=24,msgno,epoch,week,udi,ns=6;
     
     trace(4,"encode_ssr_head: type=%d sys=%d nsat=%d sync=%d iod=%d udint=%.0f\n",
           type,sys,nsat,sync,iod,udint);
     
+#ifndef SSR_QZSS_DRAFT_V05
+    ns=sys==SYS_QZS?4:6;
+#endif
     switch (sys) {
-        case SYS_GPS: msgno=1056+type; np=6; break;
-        case SYS_GLO: msgno=1062+type; np=6; break;
-        case SYS_GAL: msgno=1239+type; np=6; break;
-        case SYS_QZS: msgno=1245+type; np=4; break;
+        case SYS_GPS: msgno=(type==7)?2065:1056+type; break;
+        case SYS_GLO: msgno=(type==7)?2066:1062+type; break;
+        case SYS_GAL: msgno=(type==7)?2067:1239+type; break;
+        case SYS_QZS: msgno=(type==7)?2068:1245+type; break;
+        case SYS_CMP: msgno=(type==7)?2070:1257+type; break;
+        case SYS_SBS: msgno=(type==7)?2069:1251+type; break;
         default: return 0;
     }
     setbitu(rtcm->buff,i,12,msgno    ); i+=12; /* message number */
@@ -1113,22 +1320,53 @@ static int encode_ssr_head(int type, rtcm_t *rtcm, int sys, int nsat, int sync,
     setbitu(rtcm->buff,i, 4,iod    ); i+= 4; /* iod ssr */
     setbitu(rtcm->buff,i,16,provid ); i+=16; /* provider id */
     setbitu(rtcm->buff,i, 4,solid  ); i+= 4; /* solution id */
-    setbitu(rtcm->buff,i,np,nsat   ); i+=np; /* no of satellites */
+    if (type==7) {
+        setbitu(rtcm->buff,i,1,0); i+=1; /* dispersive bias consistency ind */
+        setbitu(rtcm->buff,i,1,0); i+=1; /* MW consistency indicator */
+    }
+    setbitu(rtcm->buff,i,ns,nsat   ); i+=ns; /* no of satellites */
     return i;
 }
+/* ssr 3 and 7 signal and tracking mode ids ----------------------------------*/
+static  const int codes_gps[]={
+    CODE_L1C,CODE_L1P,CODE_L1W,CODE_L1Y,CODE_L1M,CODE_L2C,CODE_L2D,CODE_L2S,
+    CODE_L2L,CODE_L2X,CODE_L2P,CODE_L2W,CODE_L2Y,CODE_L2M,CODE_L5I,CODE_L5Q,
+    CODE_L5X
+};
+static const int codes_glo[]={
+    CODE_L1C,CODE_L1P,CODE_L2C,CODE_L2P
+};
+static const int codes_gal[]={
+    CODE_L1A,CODE_L1B,CODE_L1C,CODE_L1X,CODE_L1Z,CODE_L5I,CODE_L5Q,CODE_L5X,
+    CODE_L7I,CODE_L7Q,CODE_L7X,CODE_L8I,CODE_L8Q,CODE_L8X,CODE_L6A,CODE_L6B,
+    CODE_L6C,CODE_L6X,CODE_L6Z
+};
+static const int codes_qzs[]={
+    CODE_L1C,CODE_L1S,CODE_L1L,CODE_L2S,CODE_L2L,CODE_L2X,CODE_L5I,CODE_L5Q,
+    CODE_L5X,CODE_L6S,CODE_L6L,CODE_L6X,CODE_L1X
+};
+static const int codes_bds[]={
+    CODE_L1I,CODE_L1Q,CODE_L1X,CODE_L7I,CODE_L7Q,CODE_L7X,CODE_L6I,CODE_L6Q,
+    CODE_L6X
+};
+static const int codes_sbs[]={
+    CODE_L1C,CODE_L5I,CODE_L5Q,CODE_L5X
+};
 /* encode ssr 1: orbit corrections -------------------------------------------*/
 static int encode_ssr1(rtcm_t *rtcm, int sys, int sync)
 {
     double udint=0.0;
-    int i,j,iod=0,nsat,prn,iode,refd=0,np,offp,deph[3],ddeph[3];
+    int i,j,iod=0,nsat,prn,iode,iodcrc,refd=0,np,ni,nj,offp,deph[3],ddeph[3];
     
     trace(3,"encode_ssr1: sys=%d sync=%d\n",sys,sync);
     
     switch (sys) {
-        case SYS_GPS: np=6; offp=  0; break;
-        case SYS_GLO: np=5; offp=  0; break;
-        case SYS_GAL: np=6; offp=  0; break;
-        case SYS_QZS: np=4; offp=192; break;
+        case SYS_GPS: np=6; ni= 8; nj= 0; offp=  0; break;
+        case SYS_GLO: np=5; ni= 8; nj= 0; offp=  0; break;
+        case SYS_GAL: np=6; ni=10; nj= 0; offp=  0; break;
+        case SYS_QZS: np=4; ni= 8; nj= 0; offp=192; break;
+        case SYS_CMP: np=6; ni=10; nj=24; offp=  1; break;
+        case SYS_SBS: np=6; ni= 9; nj=24; offp=120; break;
         default: return 0;
     }
     /* number of satellites */
@@ -1145,7 +1383,8 @@ static int encode_ssr1(rtcm_t *rtcm, int sys, int sync)
     for (j=0;j<MAXSAT;j++) {
         if (satsys(j+1,&prn)!=sys||!rtcm->ssr[j].update) continue;
         
-        iode=rtcm->ssr[j].iode;
+        iode=rtcm->ssr[j].iode;      /* sbas/bds: toe/t0 modulo */
+        iodcrc=rtcm->ssr[j].iodcrc;  /* sbas/bds: iod crc */
         
         deph [0]=ROUND(rtcm->ssr[j].deph [0]/1E-4);
         deph [1]=ROUND(rtcm->ssr[j].deph [1]/4E-4);
@@ -1154,8 +1393,9 @@ static int encode_ssr1(rtcm_t *rtcm, int sys, int sync)
         ddeph[1]=ROUND(rtcm->ssr[j].ddeph[1]/4E-6);
         ddeph[2]=ROUND(rtcm->ssr[j].ddeph[2]/4E-6);
         
-        setbitu(rtcm->buff,i,np,prn+offp); i+=np; /* satellite id */
-        setbitu(rtcm->buff,i, 8,iode    ); i+= 8; /* iode */
+        setbitu(rtcm->buff,i,np,prn-offp); i+=np; /* satellite id */
+        setbitu(rtcm->buff,i,ni,iode    ); i+=ni; /* iode */
+        setbitu(rtcm->buff,i,nj,iodcrc  ); i+=nj; /* iodcrc */
         setbits(rtcm->buff,i,22,deph [0]); i+=22; /* delta radial */
         setbits(rtcm->buff,i,20,deph [1]); i+=20; /* delta along-track */
         setbits(rtcm->buff,i,20,deph [2]); i+=20; /* delta cross-track */
@@ -1179,6 +1419,8 @@ static int encode_ssr2(rtcm_t *rtcm, int sys, int sync)
         case SYS_GLO: np=5; offp=  0; break;
         case SYS_GAL: np=6; offp=  0; break;
         case SYS_QZS: np=4; offp=192; break;
+        case SYS_CMP: np=6; offp=  1; break;
+        case SYS_SBS: np=6; offp=120; break;
         default: return 0;
     }
     /* number of satellites */
@@ -1211,23 +1453,6 @@ static int encode_ssr2(rtcm_t *rtcm, int sys, int sync)
 /* encode ssr 3: satellite code biases ---------------------------------------*/
 static int encode_ssr3(rtcm_t *rtcm, int sys, int sync)
 {
-    const int codes_gps[]={
-        CODE_L1C,CODE_L1P,CODE_L1W,CODE_L1Y,CODE_L1M,CODE_L2C,CODE_L2D,CODE_L2S,
-        CODE_L2L,CODE_L2X,CODE_L2P,CODE_L2W,CODE_L2Y,CODE_L2M,CODE_L5I,CODE_L5Q,
-        CODE_L5X
-    };
-    const int codes_glo[]={
-        CODE_L1C,CODE_L1P,CODE_L2C,CODE_L2P
-    };
-    const int codes_gal[]={
-        CODE_L1A,CODE_L1B,CODE_L1C,CODE_L1X,CODE_L1Z,CODE_L5I,CODE_L5Q,CODE_L5X,
-        CODE_L7I,CODE_L7Q,CODE_L7X,CODE_L8I,CODE_L8Q,CODE_L8X,CODE_L6A,CODE_L6B,
-        CODE_L6C,CODE_L6X,CODE_L6Z
-    };
-    const int codes_qzs[]={
-        CODE_L1C,CODE_L1S,CODE_L1L,CODE_L2S,CODE_L2L,CODE_L2X,CODE_L5I,CODE_L5Q,
-        CODE_L5X
-    };
     const int *codes;
     double udint=0.0;
     int i,j,k,iod=0,nsat,prn,nbias,np,offp,ncode;
@@ -1236,10 +1461,12 @@ static int encode_ssr3(rtcm_t *rtcm, int sys, int sync)
     trace(3,"encode_ssr3: sys=%d sync=%d\n",sys,sync);
     
     switch (sys) {
-        case SYS_GPS: np=6; offp=  0; codes=codes_gps; ncode=16; break;
-        case SYS_GLO: np=5; offp=  0; codes=codes_glo; ncode= 3; break;
-        case SYS_GAL: np=6; offp=  0; codes=codes_gal; ncode=18; break;
-        case SYS_QZS: np=4; offp=192; codes=codes_qzs; ncode= 9; break;
+        case SYS_GPS: np=6; offp=  0; codes=codes_gps; ncode=17; break;
+        case SYS_GLO: np=5; offp=  0; codes=codes_glo; ncode= 4; break;
+        case SYS_GAL: np=6; offp=  0; codes=codes_gal; ncode=19; break;
+        case SYS_QZS: np=4; offp=192; codes=codes_qzs; ncode=13; break;
+        case SYS_CMP: np=6; offp=  1; codes=codes_bds; ncode= 9; break;
+        case SYS_SBS: np=6; offp=120; codes=codes_sbs; ncode= 4; break;
         default: return 0;
     }
     /* number of satellites */
@@ -1275,15 +1502,18 @@ static int encode_ssr3(rtcm_t *rtcm, int sys, int sync)
 static int encode_ssr4(rtcm_t *rtcm, int sys, int sync)
 {
     double udint=0.0;
-    int i,j,iod=0,nsat,prn,iode,refd=0,np,offp,deph[3],ddeph[3],dclk[3];
+    int i,j,iod=0,nsat,prn,iode,iodcrc,refd=0,np,ni,nj,offp;
+    int deph[3],ddeph[3],dclk[3];
     
     trace(3,"encode_ssr4: sys=%d sync=%d\n",sys,sync);
     
     switch (sys) {
-        case SYS_GPS: np=6; offp=  0; break;
-        case SYS_GLO: np=5; offp=  0; break;
-        case SYS_GAL: np=6; offp=  0; break;
-        case SYS_QZS: np=4; offp=192; break;
+        case SYS_GPS: np=6; ni= 8; nj= 0; offp=  0; break;
+        case SYS_GLO: np=5; ni= 8; nj= 0; offp=  0; break;
+        case SYS_GAL: np=6; ni=10; nj= 0; offp=  0; break;
+        case SYS_QZS: np=4; ni= 8; nj= 0; offp=192; break;
+        case SYS_CMP: np=6; ni=10; nj=24; offp=  1; break;
+        case SYS_SBS: np=6; ni= 9; nj=24; offp=120; break;
         default: return 0;
     }
     /* number of satellites */
@@ -1301,6 +1531,7 @@ static int encode_ssr4(rtcm_t *rtcm, int sys, int sync)
         if (satsys(j+1,&prn)!=sys||!rtcm->ssr[j].update) continue;
         
         iode=rtcm->ssr[j].iode;
+        iodcrc=rtcm->ssr[j].iodcrc;
         
         deph [0]=ROUND(rtcm->ssr[j].deph [0]/1E-4);
         deph [1]=ROUND(rtcm->ssr[j].deph [1]/4E-4);
@@ -1312,8 +1543,9 @@ static int encode_ssr4(rtcm_t *rtcm, int sys, int sync)
         dclk [1]=ROUND(rtcm->ssr[j].dclk [1]/1E-6);
         dclk [2]=ROUND(rtcm->ssr[j].dclk [2]/1E-8);
         
-        setbitu(rtcm->buff,i,np,prn+offp); i+=np; /* satellite id */
-        setbitu(rtcm->buff,i, 8,iode    ); i+= 8; /* iode */
+        setbitu(rtcm->buff,i,np,prn-offp); i+=np; /* satellite id */
+        setbitu(rtcm->buff,i,ni,iode    ); i+=ni; /* iode */
+        setbitu(rtcm->buff,i,nj,iodcrc  ); i+=nj; /* iodcrc */
         setbits(rtcm->buff,i,22,deph [0]); i+=22; /* delta raidal */
         setbits(rtcm->buff,i,20,deph [1]); i+=20; /* delta along-track */
         setbits(rtcm->buff,i,20,deph [2]); i+=20; /* delta cross-track */
@@ -1340,6 +1572,8 @@ static int encode_ssr5(rtcm_t *rtcm, int sys, int sync)
         case SYS_GLO: np=5; offp=  0; break;
         case SYS_GAL: np=6; offp=  0; break;
         case SYS_QZS: np=4; offp=192; break;
+        case SYS_CMP: np=6; offp=  1; break;
+        case SYS_SBS: np=6; offp=120; break;
         default: return 0;
     }
     /* number of satellites */
@@ -1356,7 +1590,7 @@ static int encode_ssr5(rtcm_t *rtcm, int sys, int sync)
         if (satsys(j+1,&prn)!=sys||!rtcm->ssr[j].update) continue;
         
         ura=rtcm->ssr[j].ura;
-        setbitu(rtcm->buff,i,np,prn+offp); i+=np; /* satellite id */
+        setbitu(rtcm->buff,i,np,prn-offp); i+=np; /* satellite id */
         setbitu(rtcm->buff,i, 6,ura     ); i+= 6; /* ssr ura */
     }
     rtcm->nbit=i;
@@ -1375,6 +1609,8 @@ static int encode_ssr6(rtcm_t *rtcm, int sys, int sync)
         case SYS_GLO: np=5; offp=  0; break;
         case SYS_GAL: np=6; offp=  0; break;
         case SYS_QZS: np=4; offp=192; break;
+        case SYS_CMP: np=6; offp=  1; break;
+        case SYS_SBS: np=6; offp=120; break;
         default: return 0;
     }
     /* number of satellites */
@@ -1392,8 +1628,64 @@ static int encode_ssr6(rtcm_t *rtcm, int sys, int sync)
         
         hrclk=ROUND(rtcm->ssr[j].hrclk/1E-4);
         
-        setbitu(rtcm->buff,i,np,prn+offp); i+=np; /* satellite id */
+        setbitu(rtcm->buff,i,np,prn-offp); i+=np; /* satellite id */
         setbits(rtcm->buff,i,22,hrclk   ); i+=22; /* high rate clock corr */
+    }
+    rtcm->nbit=i;
+    return 1;
+}
+/* encode ssr 7: satellite phase biases --------------------------------------*/
+static int encode_ssr7(rtcm_t *rtcm, int sys, int sync)
+{
+    const int *codes;
+    double udint=0.0;
+    int i,j,k,iod=0,nsat,prn,nbias,np,offp,ncode;
+    int code[MAXCODE],pbias[MAXCODE],stdpb[MAXCODE],yaw_ang,yaw_rate;
+    
+    trace(3,"encode_ssr7: sys=%d sync=%d\n",sys,sync);
+    
+    switch (sys) {
+        case SYS_GPS: np=6; offp=  0; codes=codes_gps; ncode=17; break;
+        case SYS_GLO: np=5; offp=  0; codes=codes_glo; ncode= 4; break;
+        case SYS_GAL: np=6; offp=  0; codes=codes_gal; ncode=19; break;
+        case SYS_QZS: np=4; offp=192; codes=codes_qzs; ncode=13; break;
+        case SYS_CMP: np=6; offp=  1; codes=codes_bds; ncode= 9; break;
+        default: return 0;
+    }
+    /* number of satellites */
+    for (j=nsat=0;j<MAXSAT;j++) {
+        if (satsys(j+1,&prn)!=sys||!rtcm->ssr[j].update) continue;
+        nsat++;
+        udint=rtcm->ssr[j].udi[5];
+        iod  =rtcm->ssr[j].iod[5];
+    }
+    /* encode ssr header */
+    i=encode_ssr_head(7,rtcm,sys,nsat,sync,iod,udint,0,0,0);
+    
+    for (j=nsat=0;j<MAXSAT;j++) {
+        if (satsys(j+1,&prn)!=sys||!rtcm->ssr[j].update) continue;
+        
+        for (k=nbias=0;k<ncode;k++) {
+            if (rtcm->ssr[j].pbias[codes[k]-1]==0.0) continue;
+            code[nbias]=k;
+            pbias[nbias  ]=ROUND(rtcm->ssr[j].pbias[codes[k]-1]/0.0001);
+            stdpb[nbias++]=ROUND(rtcm->ssr[j].stdpb[codes[k]-1]/0.0001);
+        }
+        yaw_ang =ROUND(rtcm->ssr[j].yaw_ang /180.0* 256.0);
+        yaw_rate=ROUND(rtcm->ssr[j].yaw_rate/180.0*8192.0);
+        setbitu(rtcm->buff,i,np,prn-offp); i+=np; /* satellite id */
+        setbitu(rtcm->buff,i, 5,nbias);    i+= 5; /* number of code biases */
+        setbitu(rtcm->buff,i, 9,yaw_ang);  i+= 9; /* yaw angle */
+        setbits(rtcm->buff,i, 8,yaw_rate); i+= 8; /* yaw rate */
+        
+        for (k=0;k<nbias;k++) {
+            setbitu(rtcm->buff,i, 5,code[k] ); i+= 5; /* signal indicator */
+            setbitu(rtcm->buff,i, 1,0       ); i+= 1; /* integer-indicator */
+            setbitu(rtcm->buff,i, 2,0       ); i+= 2; /* WL integer-indicator */
+            setbitu(rtcm->buff,i, 4,0       ); i+= 4; /* discont counter */
+            setbits(rtcm->buff,i,20,pbias[k]); i+=20; /* phase bias */
+            setbits(rtcm->buff,i,17,stdpb[k]); i+=17; /* std-dev phase bias */
+        }
     }
     rtcm->nbit=i;
     return 1;
@@ -1437,6 +1729,11 @@ static int to_sigid(int sys, unsigned char code, int *freq)
         case SYS_SBS: msm_sig=msm_sig_sbs; break;
         case SYS_CMP: msm_sig=msm_sig_cmp; break;
         default: return 0;
+    }
+    /* freqency index for beidou */
+    if (sys==SYS_CMP) {
+        if      (*freq==5) *freq=2; /* B2 */
+        else if (*freq==4) *freq=3; /* B3 */
     }
     for (i=0;i<32;i++) {
         if (!strcmp(sig,msm_sig[i])) return i+1;
@@ -1511,7 +1808,7 @@ static void gen_msm_sat(rtcm_t *rtcm, int sys, int nsat,
             if (rrate[k]==0.0&&data->D[j]!=0.0) rrate[k]=rrate_s;
             
             /* extended satellite info */
-            info[k]=sys!=SYS_GLO?0:(fcn<0?15:fcn);
+            if (info) info[k]=sys!=SYS_GLO?0:(fcn<0?15:fcn);
         }
     }
 }
@@ -1596,6 +1893,10 @@ static int encode_msm_head(int type, rtcm_t *rtcm, int sys, int sync, int *nsat,
         tow=time2gpst(timeadd(gpst2utc(rtcm->time),10800.0),NULL);
         dow=(unsigned int)(tow/86400.0);
         epoch=(dow<<27)+ROUND_U(fmod(tow,86400.0)*1E3);
+    }
+    else if (sys==SYS_CMP) {
+        /* beidou time (tow-ms) */
+        epoch=ROUND_U(time2gpst(gpst2bdt(rtcm->time),NULL)*1E3);
     }
     else {
         /* gps, qzs and galileo time (tow-ms) */
@@ -2085,7 +2386,9 @@ extern int encode_rtcm3(rtcm_t *rtcm, int type, int sync)
         case 1033: ret=encode_type1033(rtcm,sync);     break;
         case 1044: ret=encode_type1044(rtcm,sync);     break;
         case 1045: ret=encode_type1045(rtcm,sync);     break;
-        case 1046: ret=encode_type1046(rtcm,sync);     break;
+        case 1046: ret=encode_type1046(rtcm,sync);     break; /* extension for IGS MGEX */
+        case 1047: ret=encode_type1047(rtcm,sync);     break; /* beidou ephemeris (tentative mt) */
+        case   63: ret=encode_type63  (rtcm,sync);     break; /* beidou ephemeris (rtcm draft) */
         case 1057: ret=encode_ssr1(rtcm,SYS_GPS,sync); break;
         case 1058: ret=encode_ssr2(rtcm,SYS_GPS,sync); break;
         case 1059: ret=encode_ssr3(rtcm,SYS_GPS,sync); break;
@@ -2152,10 +2455,29 @@ extern int encode_rtcm3(rtcm_t *rtcm, int type, int sync)
         case 1249: ret=encode_ssr4(rtcm,SYS_QZS,sync); break;
         case 1250: ret=encode_ssr5(rtcm,SYS_QZS,sync); break;
         case 1251: ret=encode_ssr6(rtcm,SYS_QZS,sync); break;
+        case 1252: ret=encode_ssr1(rtcm,SYS_SBS,sync); break;
+        case 1253: ret=encode_ssr2(rtcm,SYS_SBS,sync); break;
+        case 1254: ret=encode_ssr3(rtcm,SYS_SBS,sync); break;
+        case 1255: ret=encode_ssr4(rtcm,SYS_SBS,sync); break;
+        case 1256: ret=encode_ssr5(rtcm,SYS_SBS,sync); break;
+        case 1257: ret=encode_ssr6(rtcm,SYS_SBS,sync); break;
+        case 1258: ret=encode_ssr1(rtcm,SYS_CMP,sync); break;
+        case 1259: ret=encode_ssr2(rtcm,SYS_CMP,sync); break;
+        case 1260: ret=encode_ssr3(rtcm,SYS_CMP,sync); break;
+        case 1261: ret=encode_ssr4(rtcm,SYS_CMP,sync); break;
+        case 1262: ret=encode_ssr5(rtcm,SYS_CMP,sync); break;
+        case 1263: ret=encode_ssr6(rtcm,SYS_CMP,sync); break;
+        case 2065: ret=encode_ssr7(rtcm,SYS_GPS,sync); break; /* tentative */
+        case 2066: ret=encode_ssr7(rtcm,SYS_GLO,sync); break; /* tentative */
+        case 2067: ret=encode_ssr7(rtcm,SYS_GAL,sync); break; /* tentative */
+        case 2068: ret=encode_ssr7(rtcm,SYS_QZS,sync); break; /* tentative */
+        case 2070: ret=encode_ssr7(rtcm,SYS_CMP,sync); break; /* tentative */
     }
     if (ret>0) {
         type-=1000;
-        if (1<=type&&type<=299) rtcm->nmsg3[type]++; else rtcm->nmsg3[0]++;
+        if      (   1<=type&&type<= 299) rtcm->nmsg3[type    ]++; /* 1001-1299 */
+        else if (1000<=type&&type<=1099) rtcm->nmsg3[type-700]++; /* 2000-2099 */
+        else rtcm->nmsg3[0]++;
     }
     return ret;
 }

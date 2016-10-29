@@ -1,7 +1,8 @@
 /*------------------------------------------------------------------------------
 * nvs.c : NVS receiver dependent functions
 *
-*          Copyright (C) 2012 by M.BAVARO and T.TAKASU, All rights reserved.
+*    Copyright (C) 2012-2016 by M.BAVARO and T.TAKASU, All rights reserved.
+*    Copyright (C) 2014 by T.TAKASU, All rights reserved.
 *
 *     [1] Description of BINR messages which is used by RC program for RINEX
 *         files accumulation, NVS
@@ -10,10 +11,14 @@
 * version : $Revision:$ $Date:$
 * history : 2012/01/30 1.0  first version by M.BAVARO
 *           2012/11/08 1.1  modified by T.TAKASU
+*           2013/02/23 1.2  fix memory access violation problem on arm
+*           2013/04/24 1.3  fix bug on cycle-slip detection
+*                           add range check of gps ephemeris week
+*           2013/09/01 1.4  add check error of week, time jump, obs data range
+*           2014/08/26 1.5  fix bug on iode in glonass ephemeris
+*           2016/01/26 1.6  fix bug on unrecognized meas data (#130)
 *-----------------------------------------------------------------------------*/
-#include "../rtklib.h"
-#include <stdint.h>
-#include "serialisation_inline.h"
+#include "rtklib.h"
 
 #define NVSSYNC     0x10        /* nvs message sync code 1 */
 #define NVSENDMSG   0x03        /* nvs message sync code 1 */
@@ -33,6 +38,16 @@
 
 static const char rcsid[]="$Id: nvs.c,v 1.0 2012/01/30 00:05:05 MBAVA Exp $";
 
+/* get fields (little-endian) ------------------------------------------------*/
+#define U1(p) (*((unsigned char *)(p)))
+#define I1(p) (*((char *)(p)))
+static unsigned short U2(unsigned char *p) {unsigned short u; memcpy(&u,p,2); return u;}
+static unsigned int   U4(unsigned char *p) {unsigned int   u; memcpy(&u,p,4); return u;}
+static short          I2(unsigned char *p) {short          i; memcpy(&i,p,2); return i;}
+static int            I4(unsigned char *p) {int            i; memcpy(&i,p,4); return i;}
+static float          R4(unsigned char *p) {float          r; memcpy(&r,p,4); return r;}
+static double         R8(unsigned char *p) {double         r; memcpy(&r,p,8); return r;}
+
 /* ura values (ref [3] 20.3.3.3.1.1) -----------------------------------------*/
 static const double ura_eph[]={
     2.4,3.4,4.85,6.85,9.65,13.65,24.0,48.0,96.0,192.0,384.0,768.0,1536.0,
@@ -51,29 +66,36 @@ static int decode_xf5raw(raw_t *raw)
     gtime_t time;
     double tadj=0.0,toff=0.0,tn;
     int dTowInt;
-    double dTowUTC, dTowGPS, dTowFrac;
+    double dTowUTC, dTowGPS, dTowFrac, L1, P1, D1;
     double gpsutcTimescale;
     unsigned char rcvTimeScaleCorr, sys, carrNo;
     int i,j,prn,sat,n=0,nsat,week;
     unsigned char *p=raw->buff+2;
-    char *q,tstr[32];
+    char *q,tstr[32],flag;
     
     trace(4,"decode_xf5raw: len=%d\n",raw->len);
     
-    /* time tag adjustment option (-tadj) */
+    /* time tag adjustment option (-TADJ) */
     if ((q=strstr(raw->opt,"-tadj"))) {
-        sscanf(q,"-tadj %lf",&tadj);
+        sscanf(q,"-TADJ=%lf",&tadj);
     }
-    dTowUTC =R8(p  );
-    week=adjgpsweek(U2(p+8));
+    dTowUTC =R8(p);
+    week = U2(p+8);
     gpsutcTimescale = R8(p+10);
     /* glonassutcTimescale = R8(p+18); */
     rcvTimeScaleCorr = I1(p+26);
     
+    /* check gps week range */
+    if (week>=4096) {
+        trace(2,"nvs xf5raw obs week error: week=%d\n",week);
+        return -1;
+    }
+    week=adjgpsweek(week);
+    
     if ((raw->len - 31)%30) {
         
         /* Message length is not correct: there could be an error in the stream */
-        trace(2,"raw->len=%d seems not be correct\n",raw->len);
+        trace(2,"nvs xf5raw len=%d seems not be correct\n",raw->len);
         return -1;
     }
     nsat = (raw->len - 31)/30;
@@ -91,26 +113,49 @@ static int decode_xf5raw(raw_t *raw)
         toff=(tn-floor(tn+0.5))*tadj;
         time=timeadd(time,-toff);
     }
+    /* check time tag jump and output warning */
+    if (raw->time.time&&fabs(timediff(time,raw->time))>86400.0) {
+        time2str(time,tstr,3);
+        trace(2,"nvs xf5raw time tag jump warning: time=%s\n",tstr);
+    }
     if (fabs(timediff(time,raw->time))<=1e-3) {
         time2str(time,tstr,3);
         trace(2,"nvs xf5raw time tag duplicated: time=%s\n",tstr);
         return 0;
     }
-    for (i=0,p+=27;(i<nsat) && (i<MAXOBS); i++,p+=30) {
+    for (i=0,p+=27;(i<nsat) && (n<MAXOBS); i++,p+=30) {
         raw->obs.data[n].time  = time;
         sys = (U1(p)==1)?SYS_GLO:((U1(p)==2)?SYS_GPS:((U1(p)==4)?SYS_SBS:SYS_NONE));
         prn = U1(p+1);
         if (sys == SYS_SBS) prn += 120; /* Correct this */
+        if (!(sat=satno(sys,prn))) {
+            trace(2,"nvs xf5raw satellite number error: sys=%d prn=%d\n",sys,prn);
+            continue;
+        }
         carrNo = I1(p+2);
+        L1 = R8(p+ 4);
+        P1 = R8(p+12);
+        D1 = R8(p+20);
+        
+        /* check range error */
+        if (L1<-1E10||L1>1E10||P1<-1E10||P1>1E10||D1<-1E5||D1>1E5) {
+            trace(2,"nvs xf5raw obs range error: sat=%2d L1=%12.5e P1=%12.5e D1=%12.5e\n",
+                  sat,L1,P1,D1);
+            continue;
+        }
         raw->obs.data[n].SNR[0]=(unsigned char)(I1(p+3)*4.0+0.5);
         if (sys==SYS_GLO) {
-            raw->obs.data[n].L[0]  =  R8(p+ 4) - toff*(FREQ1_GLO+DFRQ1_GLO*carrNo);
+            raw->obs.data[n].L[0]  =  L1 - toff*(FREQ1_GLO+DFRQ1_GLO*carrNo);
         } else {
-            raw->obs.data[n].L[0]  =  R8(p+ 4) - toff*FREQ1;
+            raw->obs.data[n].L[0]  =  L1 - toff*FREQ1;
         }
-        raw->obs.data[n].P[0]    = (R8(p+12)-dTowFrac)*CLIGHT*0.001 - toff*CLIGHT; /* in ms, needs to be converted */
-        raw->obs.data[n].D[0]    =  R8(p+20);
-        raw->obs.data[n].LLI[0]  = ((U1(p+28) != 0x3f)&&(raw->obs.data[n].L[0] != 0))?1:0;
+        raw->obs.data[n].P[0]    = (P1-dTowFrac)*CLIGHT*0.001 - toff*CLIGHT; /* in ms, needs to be converted */
+        raw->obs.data[n].D[0]    =  (float)D1;
+        
+        /* set LLI if meas flag 4 (carrier phase present) off -> on */
+        flag=U1(p+28);
+        raw->obs.data[n].LLI[0]=(flag&0x08)&&!(raw->halfc[sat-1][0]&0x08)?1:0;
+        raw->halfc[sat-1][0]=flag;
         
 #if 0
         if (raw->obs.data[n].SNR[0] > 160) {
@@ -120,28 +165,6 @@ static int decode_xf5raw(raw_t *raw)
         }
 #endif
         raw->obs.data[n].code[0] = CODE_L1C;
-        
-        /* Error checking */
-        if (((raw->obs.data[n].P[0]) < -10E6) || ((raw->obs.data[n].P[0]) > +60E6)) {
-            raw->obs.n = 0;
-            trace(2,"obs.data[%d].P=%e unlikely to be correct\n", n, raw->obs.data[n].P[0]);
-            
-            /* Unlikely to be possible if the clock bias does not run free */
-            /* there could be an error in the stream */
-            return -1;
-        }
-        if (((raw->obs.data[n].D[0]) < -15E3) || ((raw->obs.data[n].D[0]) > +15E3)) {
-            raw->obs.n = 0;
-            trace(2,"obs.data[%d].D=%+7.1f unlikely to be correct\n", n, raw->obs.data[n].D[0]);
-            
-            /* Unlikely to be possible with a TCXO */
-            /* there could be an error in the stream */
-            return -1;
-        }
-        if (!(sat=satno(sys,prn))) {
-            trace(2,"oem3 regb satellite number error: sys=%d prn=%d\n",sys,prn);
-            continue;
-        }
         raw->obs.data[n].sat = sat;
         
         for (j=1;j<NFREQ+NEXOBS;j++) {
@@ -195,6 +218,10 @@ static int decode_gpsephem(int sat, raw_t *raw)
     week       = I2(&puiTmp[136]);
     eph.fit    = 0;
     
+    if (week>=4096) {
+        trace(2,"nvs gps ephemeris week error: sat=%2d week=%d\n",sat,week);
+        return -1;
+    }
     eph.week=adjgpsweek(week);
     eph.toe=gpst2time(eph.week,eph.toes);
     eph.toc=gpst2time(eph.week,toc);
@@ -254,7 +281,7 @@ static int decode_gloephem(int sat, raw_t *raw)
     }
     if (raw->time.time==0) return 0;
     
-    geph.iode=(tb/900)&0x3F;
+    geph.iode=(tb/900)&0x7F;
     geph.toe=utc2gpst(adjday(raw->time,tb-10800.0));
     geph.tof=utc2gpst(adjday(raw->time,tk-10800.0));
 #if 0
@@ -416,13 +443,17 @@ static int decode_nvs(raw_t *raw)
 /* input NVS raw message from stream -------------------------------------------
 * fetch next NVS raw data and input a message from stream
 * args   : raw_t *raw   IO     receiver raw data control struct
-*            raw->opt : u-blox raw options
-*                "-invcp" : inversed polarity of carrier-phase
-*                "-EPHALL"  : output all ephemerides
 *          unsigned char data I stream data (1 byte)
 * return : status (-1: error message, 0: no message, 1: input observation data,
 *                  2: input ephemeris, 3: input sbas message,
 *                  9: input ion/utc parameter)
+*
+* notes  : to specify input options, set raw->opt to the following option
+*          strings separated by spaces.
+*
+*          -EPHALL    : input all ephemerides
+*          -TADJ=tint : adjust time tags to multiples of tint (sec)
+*
 *-----------------------------------------------------------------------------*/
 extern int input_nvs(raw_t *raw, unsigned char data)
 {
@@ -430,7 +461,7 @@ extern int input_nvs(raw_t *raw, unsigned char data)
     
     /* synchronize frame */
     if ((raw->nbyte==0) && (data==NVSSYNC)) {
-      
+        
         /* Search a 0x10 */
         raw->buff[0] = data;
         raw->nbyte=1;

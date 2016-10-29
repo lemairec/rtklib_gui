@@ -13,6 +13,7 @@
 * version : $Revision:$ $Date:$
 * history : 2012/11/01 1.0  new
 *           2013/01/25 1.1  fix bug on binary search
+*           2014/08/26 1.2  fix bug on tle_pos() to get tle by satid or desig
 *-----------------------------------------------------------------------------*/
 #include "rtklib.h"
 
@@ -474,7 +475,7 @@ extern int tle_name_read(const char *file, tle_t *tle)
                 !strcmp(tle->data[i].desig,desig)) break;
         }
         if (i>=tle->n) {
-            trace(2,"no tle data: satno=%s desig=%s\n",satno,desig);
+            trace(4,"no tle data: satno=%s desig=%s\n",satno,desig);
             continue;
         }
         strncpy(tle->data[i].name,name,31);
@@ -504,8 +505,8 @@ extern int tle_pos(gtime_t time, const char *name, const char *satno,
                    double *rs)
 {
     gtime_t tutc;
-    double tsince,rs_tle[6],rs_pef[6],gmst,xp=0.0,yp=0.0,ut1_utc=0.0;
-    double R1[9]={0},R2[9]={0},R3[9]={0},W[9];
+    double tsince,rs_tle[6],rs_pef[6],gmst;
+    double R1[9]={0},R2[9]={0},R3[9]={0},W[9],erpv[5]={0};
     int i=0,j,k,stat=1;
     
     /* binary search by satellite name */
@@ -522,10 +523,10 @@ extern int tle_pos(gtime_t time, const char *name, const char *satno,
             if (!strcmp(tle->data[i].satno,satno)||
                 !strcmp(tle->data[i].desig,desig)) break;
         }
-        if (i>=tle->n) stat=1;
+        if (i<tle->n) stat=0;
     }
     if (stat) {
-        trace(2,"no tle data: name=%s satno=%s desig=%s\n",name,satno,desig);
+        trace(4,"no tle data: name=%s satno=%s desig=%s\n",name,satno,desig);
         return 0;
     }
     tutc=gpst2utc(time);
@@ -536,16 +537,15 @@ extern int tle_pos(gtime_t time, const char *name, const char *satno,
     /* SGP4 model propagator by STR#3 */
     SGP4_STR3(tsince,tle->data+i,rs_tle);
     
-    if (erp) {
-        xp=erp->xp; yp=erp->yp;
-        ut1_utc=erp->ut1_utc;;
-    }
+    /* erp values */
+    if (erp) geterp(erp,time,erpv);
+    
     /* GMST (rad) */
-    gmst=utc2gmst(tutc,ut1_utc);
+    gmst=utc2gmst(tutc,erpv[2]);
     
     /* TEME (true equator, mean eqinox) -> ECEF (ref [2] IID, Appendix C) */
-    R1[0]=1.0; R1[4]=R1[8]=cos(-yp ); R1[7]=sin(-yp ); R1[5]=-R1[7];
-    R2[4]=1.0; R2[0]=R2[8]=cos(-xp ); R2[2]=sin(-xp ); R2[6]=-R2[2];
+    R1[0]=1.0; R1[4]=R1[8]=cos(-erpv[1]); R1[7]=sin(-erpv[1]); R1[5]=-R1[7];
+    R2[4]=1.0; R2[0]=R2[8]=cos(-erpv[0]); R2[2]=sin(-erpv[0]); R2[6]=-R2[2];
     R3[8]=1.0; R3[0]=R3[4]=cos(gmst); R3[3]=sin(gmst); R3[1]=-R3[3];
     matmul("NN",3,1,3,1.0,R3,rs_tle  ,0.0,rs_pef  );
     matmul("NN",3,1,3,1.0,R3,rs_tle+3,0.0,rs_pef+3);

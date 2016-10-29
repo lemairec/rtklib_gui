@@ -1,7 +1,7 @@
 /*------------------------------------------------------------------------------
 * rtcm.c : rtcm functions
 *
-*          Copyright (C) 2009-2012 by T.TAKASU, All rights reserved.
+*          Copyright (C) 2009-2016 by T.TAKASU, All rights reserved.
 *
 * references :
 *     [1] RTCM Recommended Standards for Differential GNSS (Global Navigation
@@ -21,6 +21,12 @@
 *     [11] RTCM Paper 034-2012-SC104-693 (draft multiple signal messages)
 *     [12] RTCM Paper 133-2012-SC104-709 (draft QZSS MSM messages)
 *     [13] RTCM Paper 122-2012-SC104-707.r1 (draft MSM messages)
+*     [14] RTCM Standard 10403.2, Differential GNSS (Global Navigation Satellite
+*          Systems) Services - version 3, February 1, 2013
+*     [15] RTCM Standard 10403.2, Differential GNSS (Global Navigation Satellite
+*          Systems) Services - version 3, with amendment 1/2, november 7, 2013
+*     [16] Proposal of new RTCM SSR Messages (ssr_1_gal_qzss_sbas_dbs_v05)
+*          2014/04/17
 *
 * version : $Revision:$ $Date:$
 * history : 2009/04/10 1.0  new
@@ -34,6 +40,9 @@
 *                           Amendment 5) (ref [7]) (2.4.1_p6)
 *           2012/05/14 1.6  separate rtcm2.c, rtcm3.c
 *                           add options to select used codes for msm
+*           2013/04/27 1.7  comply with rtcm 3.2 with amendment 1/2 (ref[15])
+*           2013/12/06 1.8  support SBAS/BeiDou SSR messages (ref[16])
+*           2016/07/29 1.9  crc24q() -> rtk_crc24q()
 *-----------------------------------------------------------------------------*/
 #include "rtklib.h"
 
@@ -91,9 +100,11 @@ extern int init_rtcm(rtcm_t *rtcm)
     rtcm->nbyte=rtcm->nbit=rtcm->len=0;
     rtcm->word=0;
     for (i=0;i<100;i++) rtcm->nmsg2[i]=0;
-    for (i=0;i<300;i++) rtcm->nmsg3[i]=0;
+    for (i=0;i<400;i++) rtcm->nmsg3[i]=0;
     
-    free_rtcm(rtcm);
+    rtcm->obs.data=NULL;
+    rtcm->nav.eph =NULL;
+    rtcm->nav.geph=NULL;
     
     /* reallocate memory for observation and ephemris buffer */
     if (!(rtcm->obs.data=(obsd_t *)malloc(sizeof(obsd_t)*MAXOBS))||
@@ -189,33 +200,45 @@ extern int input_rtcm2(rtcm_t *rtcm, unsigned char data)
 * notes  : before firstly calling the function, time in rtcm control struct has
 *          to be set to the approximate time within 1/2 week in order to resolve
 *          ambiguity of time in rtcm messages.
-*           
-*          supported RTCM 3 messages (ref [2][3][4][5][6][7][8][9][10][11][12])
+*          
+*          to specify input options, set rtcm->opt to the following option
+*          strings separated by spaces.
 *
-*            TYPE       GPS     GLOASS    GALILEO    QZSS     COMPASS    SBAS
+*          -EPHALL  : input all ephemerides
+*          -STA=nnn : input only message with STAID=nnn
+*          -GLss    : select signal ss for GPS MSM (ss=1C,1P,...)
+*          -RLss    : select signal ss for GLO MSM (ss=1C,1P,...)
+*          -ELss    : select signal ss for GAL MSM (ss=1C,1B,...)
+*          -JLss    : select signal ss for QZS MSM (ss=1C,2C,...)
+*          -CLss    : select signal ss for BDS MSM (ss=2I,7I,...)
+*
+*          supported RTCM 3 messages
+*                  (ref [2][3][4][5][6][7][8][9][10][11][12][13][14][15])
+*
+*            TYPE       GPS     GLOASS    GALILEO    QZSS     BEIDOU     SBAS
 *         ----------------------------------------------------------------------
 *          OBS C-L1  : 1001~     1009~       -         -         -         -
 *              F-L1  : 1002      1010        -         -         -         -
 *              C-L12 : 1003~     1011~       -         -         -         -
 *              F-L12 : 1004      1012        -         -         -         -
 *
-*          NAV       : 1019      1020      1045*     1044*       -         -
+*          NAV       : 1019      1020      1045*     1044*     1047*       -
 *                        -         -       1046*       -         -         -
 *
-*          MSM 1     : 1071*~    1081*~    1091*~    1111*~    1121*~    1101*~
-*              2     : 1072*~    1082*~    1092*~    1112*~    1122*~    1102*~
-*              3     : 1073*~    1083*~    1093*~    1113*~    1123*~    1103*~
-*              4     : 1074*     1084*     1094*     1114*     1124*     1104*
-*              5     : 1075*     1085*     1095*     1115*     1125*     1105*
-*              6     : 1076*     1086*     1096*     1116*     1126*     1106*
-*              7     : 1077*     1087*     1097*     1117*     1127*     1107*
+*          MSM 1     : 1071~     1081~     1091~     1111*~    1121*~    1101*~
+*              2     : 1072~     1082~     1092~     1112*~    1122*~    1102*~
+*              3     : 1073~     1083~     1093~     1113*~    1123*~    1103*~
+*              4     : 1074      1084      1094      1114*     1124*     1104*
+*              5     : 1075      1085      1095      1115*     1125*     1105*
+*              6     : 1076      1086      1096      1116*     1126*     1106*
+*              7     : 1077      1087      1097      1117*     1127*     1107*
 *
-*          SSR OBT   : 1057      1063      1240*     1246*       -         -
-*              CLK   : 1058      1064      1241*     1247*       -         -
-*              BIAS  : 1059      1065      1242*     1248*       -         -
-*              OBTCLK: 1060      1066      1243*     1249*       -         -
-*              URA   : 1061      1067      1244*     1250*       -         -
-*              HRCLK : 1062      1068      1245*     1251*       -         -
+*          SSR OBT   : 1057      1063      1240*     1246*     1258*       -
+*              CLK   : 1058      1064      1241*     1247*     1259*       -
+*              BIAS  : 1059      1065      1242*     1248*     1260*       -
+*              OBTCLK: 1060      1066      1243*     1249*     1261*       -
+*              URA   : 1061      1067      1244*     1250*     1262*       -
+*              HRCLK : 1062      1068      1245*     1251*     1263*       -
 *
 *          ANT INFO  : 1005 1006 1007 1008 1033
 *         ----------------------------------------------------------------------
@@ -223,16 +246,8 @@ extern int input_rtcm2(rtcm_t *rtcm, unsigned char data)
 *
 *          for MSM observation data with multiple signals for a frequency,
 *          a signal is selected according to internal priority. to select
-*          a specified signal, use the following options.
+*          a specified signal, use the input options.
 *
-*          rtcm->opt : rtcm input options "opt [opt ...]"
-*
-*              -Gsss : select signal sss for GPS for MSM (sss=L1C,L1P,...)
-*              -Rsss : select signal sss for GLO for MSM (sss=L1C,L1P,...)
-*              -Esss : select signal sss for GAL for MSM (sss=L1C,L1B,...)
-*              -Jsss : select signal sss for QZS for MSM (sss=L1C,L2C,...)
-*              -STA=nnn : only input STAID=nnn
-*          
 *          rtcm3 message format:
 *            +----------+--------+-----------+--------------------+----------+
 *            | preamble | 000000 |  length   |    data message    |  parity  |
@@ -259,7 +274,7 @@ extern int input_rtcm3(rtcm_t *rtcm, unsigned char data)
     rtcm->nbyte=0;
     
     /* check parity */
-    if (crc24q(rtcm->buff,rtcm->len)!=getbitu(rtcm->buff,rtcm->len*8,24)) {
+    if (rtk_crc24q(rtcm->buff,rtcm->len)!=getbitu(rtcm->buff,rtcm->len*8,24)) {
         trace(2,"rtcm3 parity error: len=%d\n",rtcm->len);
         return 0;
     }
@@ -359,7 +374,7 @@ extern int gen_rtcm3(rtcm_t *rtcm, int type, int sync)
     setbitu(rtcm->buff,14,10,rtcm->len-3);
     
     /* crc-24q */
-    crc=crc24q(rtcm->buff,rtcm->len);
+    crc=rtk_crc24q(rtcm->buff,rtcm->len);
     setbitu(rtcm->buff,i,24,crc);
     
     /* length total (bytes) */

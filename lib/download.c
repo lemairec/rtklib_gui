@@ -5,6 +5,7 @@
 *
 * version : $Revision:$ $Date:$
 * history : 2012/12/28  1.0  new
+*           2013/06/02  1.1  replace S_IREAD by S_IRUSR
 *-----------------------------------------------------------------------------*/
 #include <errno.h>
 #include <sys/stat.h>
@@ -133,7 +134,7 @@ static int exist_file(const char *local)
 #else
     struct stat buff;
     if (stat(local,&buff)) return 0;
-    return buff.st_mode&S_IREAD;
+    return buff.st_mode&S_IRUSR;
 #endif
 }
 /* test file existance -------------------------------------------------------*/
@@ -277,7 +278,7 @@ static int mkdir_r(const char *dir)
     HANDLE h;
     WIN32_FIND_DATA data;
     
-    if (!*dir||strstr(dir,":\\")) return 1;
+    if (!*dir||!strcmp(dir+1,":\\")) return 1;
     
     strcpy(pdir,dir);
     if ((p=strrchr(pdir,FILEPATHSEP))) {
@@ -288,7 +289,11 @@ static int mkdir_r(const char *dir)
         }
         else FindClose(h);
     }
-    return CreateDirectory(dir,NULL)||GetLastError()==ERROR_ALREADY_EXISTS;
+    if (CreateDirectory(dir,NULL)||
+        GetLastError()==ERROR_ALREADY_EXISTS) return 1;
+    
+    trace(2,"directory generation error: dir=%s\n",dir);
+    return 0;
 #else
     FILE *fp;
     
@@ -302,7 +307,10 @@ static int mkdir_r(const char *dir)
         }
         else fclose(fp);
     }
-    return !mkdir(dir,0777)||errno==EEXIST;
+    if (!mkdir(dir,0777)||errno==EEXIST) return 1;
+    
+    trace(2,"directory generation error: dir=%s\n",dir);
+    return 0;
 #endif
 }
 /* get remote file list ------------------------------------------------------*/
@@ -472,7 +480,7 @@ static int exec_down(const path_t *path, char *remot_p, const char *usr,
         (!strcmp(p,".z")||!strcmp(p,".gz")||!strcmp(p,".zip")||
          !strcmp(p,".Z")||!strcmp(p,".GZ")||!strcmp(p,".ZIP"))) {
         
-        if (uncompress(path->local,tmpfile)) {
+        if (rtk_uncompress(path->local,tmpfile)) {
             remove(path->local);
         }
         else {

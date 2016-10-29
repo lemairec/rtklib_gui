@@ -1,8 +1,6 @@
 /*------------------------------------------------------------------------------
 * qzslex.c : qzss lex functions
 *
-* options : -DEXTLEX   enable QZSS LEX extension
-*
 * references :
 *     [1] IS-QZSS v.1.1, Quasi-Zenith Satellite System Navigation Service
 *         Interface Specification for QZSS, Japan Aerospace Exploration Agency,
@@ -11,17 +9,22 @@
 * version : $Revision: 1.1 $ $Date: 2008/07/17 21:48:06 $
 * history : 2011/05/27 1.0  new
 *           2011/07/01 1.1  support 24bytes header format for lexconvbin()
+*           2013/03/27 1.2  support message type 12
+*           2013/05/11 1.3  fix bugs on decoding message type 12
+*           2013/09/01 1.4  consolidate mt 12 handling codes provided by T.O.
+*           2016/07/29 1.5  crc24q() -> rtk_crc24q()
 *-----------------------------------------------------------------------------*/
 #include "rtklib.h"
-
-#ifdef EXTLEX
 
 static const char rcsid[]="$Id:$";
 
 #define LEXFRMLEN       2000            /* lex frame length (bits) */
+#define LEXHDRLEN       49              /* lex header length (bits) */
+#define LEXRSLEN        256             /* lex reed solomon length (bits) */
 #define LEXFRMPREAMB    0x1ACFFC1Du     /* lex frame preamble */
 #define LEXEPHMAXAGE    360.0           /* max age of lex ephemeris (s) */
 #define LEXIONMAXAGE    3600.0          /* max age of lex ionos correction (s) */
+#define RTCM3PREAMB     0xD3            /* rtcm ver.3 frame preamble */
 
 #define LEXHEADLEN      24              /* lex binary header length (bytes) */
 
@@ -223,6 +226,149 @@ static int decode_lextype11(const lexmsg_t *msg, nav_t *nav, gtime_t *tof)
     
     return 1;
 }
+/* convert lex type 12 to rtcm ssr message -----------------------------------*/
+static int lex2rtcm(const unsigned char *msg, int i, unsigned char *buff)
+{
+    unsigned int crc;
+    int j,ns,type,n=0;
+    
+    if (i+12>=LEXFRMLEN-LEXHDRLEN-LEXRSLEN) return 0;
+    
+    switch ((type=getbitu(msg,i,12))) {
+        
+        case 1057: ns=getbitu(msg,i+62,6); n=68+ns*135; break; /* gps */
+        case 1058: ns=getbitu(msg,i+61,6); n=67+ns* 76; break;
+        case 1059: ns=getbitu(msg,i+61,6); n=67;
+                   for (j=0;j<ns;j++) n+=11+getbitu(msg,i+n+6,5)*19; break;
+        case 1060: ns=getbitu(msg,i+62,6); n=68+ns*205; break;
+        case 1061: ns=getbitu(msg,i+61,6); n=67+ns* 12; break;
+        case 1062: ns=getbitu(msg,i+61,6); n=67+ns* 28; break;
+        case 1063: ns=getbitu(msg,i+59,6); n=65+ns*134; break; /* glonass */
+        case 1064: ns=getbitu(msg,i+58,6); n=64+ns* 75; break;
+        case 1065: ns=getbitu(msg,i+58,6); n=64;
+                   for (j=0;j<ns;j++) n+=10+getbitu(msg,i+n+5,5)*19; break;
+        case 1066: ns=getbitu(msg,i+59,6); n=65+ns*204; break;
+        case 1067: ns=getbitu(msg,i+58,6); n=64+ns* 11; break;
+        case 1068: ns=getbitu(msg,i+58,6); n=64+ns* 27; break;
+        case 1240: ns=getbitu(msg,i+62,6); n=68+ns*135; break; /* galileo */
+        case 1241: ns=getbitu(msg,i+61,6); n=67+ns* 76; break;
+        case 1242: ns=getbitu(msg,i+61,6); n=67;
+                   for (j=0;j<ns;j++) n+=11+getbitu(msg,i+n+6,5)*19; break;
+        case 1243: ns=getbitu(msg,i+62,6); n=68+ns*205; break;
+        case 1244: ns=getbitu(msg,i+61,6); n=67+ns* 12; break;
+        case 1245: ns=getbitu(msg,i+61,6); n=67+ns* 28; break;
+        case 1246: ns=getbitu(msg,i+62,4); n=66+ns*133; break; /* qzss */
+        case 1247: ns=getbitu(msg,i+61,4); n=65+ns* 74; break;
+        case 1248: ns=getbitu(msg,i+61,4); n=65;
+                   for (j=0;j<ns;j++) n+=9+getbitu(msg,i+n+4,5)*19; break;
+        case 1249: ns=getbitu(msg,i+62,4); n=66+ns*203; break;
+        case 1250: ns=getbitu(msg,i+61,4); n=65+ns* 10; break;
+        case 1251: ns=getbitu(msg,i+61,4); n=65+ns* 26; break;
+        default:
+            if (type) trace(2,"lex 12: unsupported type=%4d\n",type);
+            return 0;
+    }
+    n=(n+7)/8; /* message length (bytes) */
+    
+    if (i+n*8>LEXFRMLEN-LEXRSLEN) {
+        trace(2,"lex 12: invalid ssr size: len=%4d\n",n);
+        return 0;
+    }
+    /* save rtcm message to buffer */
+    setbitu(buff, 0, 8,RTCM3PREAMB);
+    setbitu(buff, 8, 6,0);
+    setbitu(buff,14,10,n);
+    for (j=0;j<n;j++) {
+        buff[j+3]=getbitu(msg,i+j*8,8);
+    }
+    crc=rtk_crc24q(buff,3+n);
+    setbitu(buff,24+n*8,24,crc);
+    return n;
+}
+/* decode type 12: madoca orbit and clock correction -------------------------*/
+static int decode_lextype12(const lexmsg_t *msg, nav_t *nav, gtime_t *tof)
+{
+    static rtcm_t stock_rtcm={0};
+    rtcm_t rtcm={0};
+    double tow;
+    unsigned char buff[1200];
+    int i=0,j,k,l,n,week;
+    
+    trace(3,"decode_lextype12:\n");
+    
+    tow =getbitu(msg->msg,i,20); i+=20;
+    week=getbitu(msg->msg,i,13); i+=13;
+    *tof=gpst2time(week,tow);
+    
+    /* copy rtcm ssr corrections */
+    for (k=0;k<MAXSAT;k++) {
+        rtcm.ssr[k]=nav->ssr[k];
+        rtcm.ssr[k].update=0;
+    }
+    /* convert lex type 12 to rtcm ssr message */
+    while ((n=lex2rtcm(msg->msg,i,buff))) {
+        
+        rtcm.time=*tof;
+        
+        for (j=0;j<n+6;j++) {
+            
+            /* input rtcm ssr message */
+            if (input_rtcm3(&rtcm,buff[j])==-1) continue;
+            
+            /* update ssr corrections in nav data */
+            for (k=0;k<MAXSAT;k++) {
+                if (!rtcm.ssr[k].update) continue;
+                
+                rtcm.ssr[k].update=0;
+                
+                if (rtcm.ssr[k].t0[3].time){      /* ura */
+                    stock_rtcm.ssr[k].t0[3]=rtcm.ssr[k].t0[3];
+                    stock_rtcm.ssr[k].udi[3]=rtcm.ssr[k].udi[3];
+                    stock_rtcm.ssr[k].iod[3]=rtcm.ssr[k].iod[3];
+                    stock_rtcm.ssr[k].ura=rtcm.ssr[k].ura;
+                }
+                if (rtcm.ssr[k].t0[2].time){      /* hr-clock correction*/
+                    
+                    /* convert hr-clock correction to clock correction*/
+                    stock_rtcm.ssr[k].t0[1]=rtcm.ssr[k].t0[2];
+                    stock_rtcm.ssr[k].udi[1]=rtcm.ssr[k].udi[2];
+                    stock_rtcm.ssr[k].iod[1]=rtcm.ssr[k].iod[2];
+                    stock_rtcm.ssr[k].dclk[0]=rtcm.ssr[k].hrclk;
+                    stock_rtcm.ssr[k].dclk[1]=stock_rtcm.ssr[k].dclk[2]=0.0;
+                    
+                    /* activate orbit correction(60.0s is tentative) */
+                    if((stock_rtcm.ssr[k].iod[0]==rtcm.ssr[k].iod[2]) &&
+                       (timediff(stock_rtcm.ssr[k].t0[0],rtcm.ssr[k].t0[2]) < 60.0)){
+                        rtcm.ssr[k] = stock_rtcm.ssr[k];
+                    }
+                    else continue; /* not apply */
+                }
+                else if (rtcm.ssr[k].t0[0].time){ /* orbit correction*/
+                    stock_rtcm.ssr[k].t0[0]=rtcm.ssr[k].t0[0];
+                    stock_rtcm.ssr[k].udi[0]=rtcm.ssr[k].udi[0];
+                    stock_rtcm.ssr[k].iod[0]=rtcm.ssr[k].iod[0];
+                    for (l=0;l<3;l++) {
+                        stock_rtcm.ssr[k].deph [l]=rtcm.ssr[k].deph [l];
+                        stock_rtcm.ssr[k].ddeph[l]=rtcm.ssr[k].ddeph[l];
+                    }
+                    stock_rtcm.ssr[k].iode=rtcm.ssr[k].iode;
+                    stock_rtcm.ssr[k].refd=rtcm.ssr[k].refd;
+                    
+                    /* activate clock correction(60.0s is tentative) */
+                    if((stock_rtcm.ssr[k].iod[1]==rtcm.ssr[k].iod[0]) &&
+                      (timediff(stock_rtcm.ssr[k].t0[1],rtcm.ssr[k].t0[0]) < 60.0)){
+                        rtcm.ssr[k] = stock_rtcm.ssr[k];
+                    }
+                    else continue; /* not apply */
+                }
+                /* apply */
+                nav->ssr[k]=rtcm.ssr[k];
+            }
+        }
+        i+=n*8;
+    }
+    return 1;
+}
 /* decode type 20: gsi experiment message (ref [1] 5.7.2.2.2) ----------------*/
 static int decode_lextype20(const lexmsg_t *msg, nav_t *nav, gtime_t *tof)
 {
@@ -244,6 +390,7 @@ extern int lexupdatecorr(const lexmsg_t *msg, nav_t *nav, gtime_t *tof)
     switch (msg->type) {
         case 10: return decode_lextype10(msg,nav,tof); /* jaxa */
         case 11: return decode_lextype11(msg,nav,tof); /* jaxa */
+        case 12: return decode_lextype12(msg,nav,tof); /* jaxa */
         case 20: return decode_lextype20(msg,nav,tof); /* gsi */
     }
     trace(2,"unsupported lex message: type=%2d\n",msg->type);
@@ -499,31 +646,26 @@ extern int lexioncorr(gtime_t time, const nav_t *nav, const double *pos,
     latpp=asin(sinlat*cosap+coslat*sinap*cosaz);
     lonpp=pos[1]+atan(sinap*sinaz/(cosap*coslat-sinap*cosaz*sinlat));
     
-#if 0
-    trace(0,"lexioncorr: pppos=%.3f %.3f\n",latpp*R2D,lonpp*R2D);
-#endif
+    trace(4,"lexioncorr: pppos=%.3f %.3f\n",latpp*R2D,lonpp*R2D);
+    
     /* inclination factor */
     F=1.0/sqrt(1.0-rp*rp);
     
     /* delta latitude/longitude (rad) */
     dlat=latpp-nav->lexion.pos0[0];
     dlon=lonpp-nav->lexion.pos0[1];
-#if 0
-    trace(0,"lexioncorr: pos0=%.1f %.1f dlat=%.1f dlon=%.1f\n",
+    trace(4,"lexioncorr: pos0=%.1f %.1f dlat=%.1f dlon=%.1f\n",
           nav->lexion.pos0[0]*R2D,nav->lexion.pos0[1]*R2D,dlat*R2D,dlon*R2D);
-#endif
     
     /* slant ionosphere delay (L1) */
     for (n=0;n<=2;n++) for (m=0;m<=1;m++) {
         Enm=nav->lexion.coef[n][m];
         *delay+=F*Enm*pow(dlat,n)*pow(dlon,m);
-#if 0
-    trace(0,"lexioncorr: F=%8.3f Enm[%d][%d]=%8.3f delay=%8.3f\n",F,n,m,Enm,F*Enm*pow(dlat,n)*pow(dlon,m));
-#endif
+        
+        trace(5,"lexioncorr: F=%8.3f Enm[%d][%d]=%8.3f delay=%8.3f\n",F,n,m,Enm,
+              F*Enm*pow(dlat,n)*pow(dlon,m));
     }
     trace(4,"lexioncorr: time=%s delay=%.3f\n",time_str(time,0),*delay);
     
     return 1;
 }
-
-#endif /* EXTLEX */

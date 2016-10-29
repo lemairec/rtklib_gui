@@ -11,9 +11,7 @@
 *           2011/07/01  1.1  suppress warning
 *           2012/02/14  1.2  add decode of gps message (0x02)
 *-----------------------------------------------------------------------------*/
-#include "../rtklib.h"
-#include <stdint.h>
-#include "serialisation_inline.h"
+#include "rtklib.h"
 
 #define GW10SYNC    0x8B        /* gw10 sync code */
 
@@ -47,6 +45,34 @@
 
 static const char rcsid[]="$Id:$";
 
+/* extract field (big-endian) ------------------------------------------------*/
+#define U1(p)       (*((unsigned char *)(p)))
+#define I1(p)       (*((char *)(p)))
+
+static unsigned short U2(unsigned char *p)
+{
+    unsigned short value;
+    unsigned char *q=(unsigned char *)&value+1;
+    int i;
+    for (i=0;i<2;i++) *q--=*p++;
+    return value;
+}
+static unsigned int U4(unsigned char *p)
+{
+    unsigned int value;
+    unsigned char *q=(unsigned char *)&value+3;
+    int i;
+    for (i=0;i<4;i++) *q--=*p++;
+    return value;
+}
+static double R8(unsigned char *p)
+{
+    double value;
+    unsigned char *q=(unsigned char *)&value+7;
+    int i;
+    for (i=0;i<8;i++) *q--=*p++;
+    return value;
+}
 /* message length ------------------------------------------------------------*/
 static int msglen(unsigned char id)
 {
@@ -101,7 +127,7 @@ static int decode_gw10raw(raw_t *raw)
     
     trace(4,"decode_gw10raw: len=%d\n",raw->len);
     
-    tow=R8r(p);
+    tow=R8(p);
     tows=floor(tow*1000.0+0.5)/1000.0; /* round by 10ms */
     toff=CLIGHT*(tows-tow);            /* time tag offset (m) */
     if (!adjweek(raw,tows)) {
@@ -115,9 +141,9 @@ static int decode_gw10raw(raw_t *raw)
             trace(2,"gw10raw satellite number error: prn=%d\n",prn);
             continue;
         }
-        pr =R8r(p+ 2)-toff;
-        snr=U2r(p+16);
-        cp =-(int)(U4r(p+18))/256.0-toff/lam[0];
+        pr =R8(p+ 2)-toff;
+        snr=U2(p+16);
+        cp =-(int)(U4(p+18))/256.0-toff/lam_carr[0];
         flg=U1(p+22);
         if (flg&0x3) {
             trace(2,"gw10raw raw data invalid: prn=%d\n",prn);
@@ -172,14 +198,14 @@ static int decode_gw10gps(raw_t *raw)
     
     trace(4,"decode_gw10gps: len=%d\n",raw->len);
     
-    tow=U4r(p)/1000.0; p+=4;
+    tow=U4(p)/1000.0; p+=4;
     prn=U1(p);        p+=1;
     if (!(sat=satno(SYS_GPS,prn))) {
         trace(2,"gw10 gps satellite number error: tow=%.1f prn=%d\n",tow,prn);
         return -1;
     }
     for (i=0;i<10;i++) {
-        buff=(buff<<30)|U4r(p); p+=4;
+        buff=(buff<<30)|U4(p); p+=4;
         
         /* check parity of word */
         if (!check_parity(buff,subfrm+i*3)) {
@@ -232,7 +258,7 @@ static int decode_gw10sbs(raw_t *raw)
     
     trace(4,"decode_gw10sbs : len=%d\n",raw->len);
     
-    tow=U4r(p)/1000.0;
+    tow=U4(p)/1000.0;
     prn=U1(p+4);
     if (prn<MINPRNSBS||MAXPRNSBS<prn) {
         trace(2,"gw10 sbs satellite number error: prn=%d\n",prn);
@@ -297,11 +323,11 @@ static int decode_gw10sol(raw_t *raw)
     
     trace(4,"decode_gw10sol : len=%d\n",raw->len);
     
-    if (U2r(p+42)&0xC00) { /* time valid? */
+    if (U2(p+42)&0xC00) { /* time valid? */
         trace(2,"gw10 sol time/day invalid\n");
         return 0;
     }
-    sec=U4r(p+27)/16384.0;
+    sec=U4(p+27)/16384.0;
     sec=floor(sec*1000.0+0.5)/1000.0;
     ep[2]=bcd2num(p[31]);
     ep[1]=bcd2num(p[32]);
@@ -336,12 +362,16 @@ static int decode_gw10(raw_t *raw)
 /* input gw10 raw message ------------------------------------------------------
 * input next gw10 raw message from stream
 * args   : raw_t *raw   IO     receiver raw data control struct
-*            raw->rcvopt : gw10 raw options
-*                "-EPHALL"  : output all ephemerides
 *          unsigned char data I stream data (1 byte)
 * return : status (-1: error message, 0: no message, 1: input observation data,
 *                  2: input ephemeris, 3: input sbas message,
 *                  9: input ion/utc parameter)
+*
+* notes  : to specify input options, set raw->opt to the following option
+*          strings separated by spaces.
+*
+*          -EPHALL    : input all ephemerides
+*
 *-----------------------------------------------------------------------------*/
 extern int input_gw10(raw_t *raw, unsigned char data)
 {

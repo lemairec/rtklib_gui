@@ -1,7 +1,7 @@
 /*------------------------------------------------------------------------------
 * preceph.c : precise ephemeris and clock functions
 *
-*          Copyright (C) 2007-2010 by T.TAKASU, All rights reserved.
+*          Copyright (C) 2007-2013 by T.TAKASU, All rights reserved.
 *
 * references :
 *     [1] S.Hilla, The Extended Standard Product 3 Orbit Format (SP3-c),
@@ -31,6 +31,15 @@
 *           2011/12/01 1.8  modify api readsp3()
 *                           precede later ephemeris if ephemeris is NULL
 *                           move eci2ecef() to rtkcmn.c
+*           2013/05/08 1.9  fix bug on computing std-dev of precise clocks
+*           2013/11/20 1.10 modify option for api readsp3()
+*           2014/04/03 1.11 accept extenstion including sp3,eph,SP3,EPH
+*           2014/05/23 1.12 add function to read sp3 velocity records
+*                           change api: satantoff()
+*           2014/08/31 1.13 add member cov and vco in peph_t sturct
+*           2014/10/13 1.14 fix bug on clock error variance in peph2pos()
+*           2015/05/10 1.15 add api readfcb()
+*                           modify api readdcb()
 *-----------------------------------------------------------------------------*/
 #include "rtklib.h"
 
@@ -51,6 +60,7 @@ static int code2sys(char code)
     if (code=='E') return SYS_GAL; /* extension to sp3-c */
     if (code=='J') return SYS_QZS; /* extension to sp3-c */
     if (code=='C') return SYS_CMP; /* extension to sp3-c */
+    if (code=='L') return SYS_LEO; /* extension to sp3-c */
     return SYS_NONE;
 }
 /* read sp3 header -----------------------------------------------------------*/
@@ -113,7 +123,7 @@ static void readsp3b(FILE *fp, char type, int *sats, int ns, double *bfact,
     peph_t peph;
     gtime_t time;
     double val,std,base;
-    int i,j,sat,sys,prn,n=ns*(type=='P'?1:2),pred_o,pred_c;
+    int i,j,sat,sys,prn,n=ns*(type=='P'?1:2),pred_o,pred_c,v;
     char buff[1024];
     
     trace(3,"readsp3b: type=%c ns=%d index=%d opt=%d\n",type,ns,index,opt);
@@ -130,13 +140,21 @@ static void readsp3b(FILE *fp, char type, int *sats, int ns, double *bfact,
         peph.time =time;
         peph.index=index;
         
-        for (i=0;i<MAXSAT;i++) for (j=0;j<4;j++) {
-            peph.pos[i][j]=0.0;
-            peph.std[i][j]=0.0f;
+        for (i=0;i<MAXSAT;i++) {
+            for (j=0;j<4;j++) {
+                peph.pos[i][j]=0.0;
+                peph.std[i][j]=0.0f;
+                peph.vel[i][j]=0.0;
+                peph.vst[i][j]=0.0f;
+            }
+            for (j=0;j<3;j++) {
+                peph.cov[i][j]=0.0f;
+                peph.vco[i][j]=0.0f;
+            }
         }
-        for (i=0;i<n&&fgets(buff,sizeof(buff),fp);i++) {
+        for (i=pred_o=pred_c=v=0;i<n&&fgets(buff,sizeof(buff),fp);i++) {
             
-            if (strlen(buff)<4||buff[0]!='P') continue;
+            if (strlen(buff)<4||(buff[0]!='P'&&buff[0]!='V')) continue;
             
             sys=buff[1]==' '?SYS_GPS:code2sys(buff[1]);
             prn=(int)str2num(buff,2,2);
@@ -145,29 +163,43 @@ static void readsp3b(FILE *fp, char type, int *sats, int ns, double *bfact,
             
             if (!(sat=satno(sys,prn))) continue;
             
-            pred_c=strlen(buff)>=76&&buff[75]=='P';
-            pred_o=strlen(buff)>=80&&buff[79]=='P';
-            
+            if (buff[0]=='P') {
+                pred_c=strlen(buff)>=76&&buff[75]=='P';
+                pred_o=strlen(buff)>=80&&buff[79]=='P';
+            }
             for (j=0;j<4;j++) {
                 
                 /* read option for predicted value */
-                if (j< 3&&opt==1&& pred_o) continue;
-                if (j< 3&&opt==2&&!pred_o) continue;
-                if (j==3&&opt==1&& pred_c) continue;
-                if (j==3&&opt==2&&!pred_c) continue;
+                if (j< 3&&(opt&1)&& pred_o) continue;
+                if (j< 3&&(opt&2)&&!pred_o) continue;
+                if (j==3&&(opt&1)&& pred_c) continue;
+                if (j==3&&(opt&2)&&!pred_c) continue;
                 
                 val=str2num(buff, 4+j*14,14);
                 std=str2num(buff,61+j* 3,j<3?2:3);
                 
-                if (val!=0.0&&fabs(val-999999.999999)>=1E-6) {
-                    peph.pos[sat-1][j]=val*(j<3?1000.0:1E-6);
+                if (buff[0]=='P') { /* position */
+                    if (val!=0.0&&fabs(val-999999.999999)>=1E-6) {
+                        peph.pos[sat-1][j]=val*(j<3?1000.0:1E-6);
+                        v=1; /* valid epoch */
+                    }
+                    if ((base=bfact[j<3?0:1])>0.0&&std>0.0) {
+                        peph.std[sat-1][j]=(float)(pow(base,std)*(j<3?1E-3:1E-12));
+                    }
                 }
-                if ((base=bfact[j<3?0:1])>0.0) {
-                    peph.std[sat-1][j]=(float)(pow(base,std)*(j<3?1E-3:1E-12));
+                else if (v) { /* velocity */
+                    if (val!=0.0&&fabs(val-999999.999999)>=1E-6) {
+                        peph.vel[sat-1][j]=val*(j<3?0.1:1E-10);
+                    }
+                    if ((base=bfact[j<3?0:1])>0.0&&std>0.0) {
+                        peph.vst[sat-1][j]=(float)(pow(base,std)*(j<3?1E-7:1E-16));
+                    }
                 }
             }
         }
-        if (!addpeph(nav,&peph)) return;
+        if (v) {
+            if (!addpeph(nav,&peph)) return;
+        }
     }
 }
 /* compare precise ephemeris -------------------------------------------------*/
@@ -178,7 +210,7 @@ static int cmppeph(const void *p1, const void *p2)
     return tt<-1E-9?-1:(tt>1E-9?1:q1->index-q2->index);
 }
 /* combine precise ephemeris -------------------------------------------------*/
-static void combpeph(nav_t *nav)
+static void combpeph(nav_t *nav, int opt)
 {
     int i,j,k,m;
     
@@ -186,16 +218,18 @@ static void combpeph(nav_t *nav)
     
     qsort(nav->peph,nav->ne,sizeof(peph_t),cmppeph);
     
+    if (opt&4) return;
+    
     for (i=0,j=1;j<nav->ne;j++) {
         
         if (fabs(timediff(nav->peph[i].time,nav->peph[j].time))<1E-9) {
             
             for (k=0;k<MAXSAT;k++) {
-#if 0
                 if (norm(nav->peph[j].pos[k],4)<=0.0) continue;
-#endif
                 for (m=0;m<4;m++) nav->peph[i].pos[k][m]=nav->peph[j].pos[k][m];
                 for (m=0;m<4;m++) nav->peph[i].std[k][m]=nav->peph[j].std[k][m];
+                for (m=0;m<4;m++) nav->peph[i].vel[k][m]=nav->peph[j].vel[k][m];
+                for (m=0;m<4;m++) nav->peph[i].vst[k][m]=nav->peph[j].vst[k][m];
             }
         }
         else if (++i<j) nav->peph[i]=nav->peph[j];
@@ -209,7 +243,8 @@ static void combpeph(nav_t *nav)
 * args   : char   *file       I   sp3-c precise ephemeris file
 *                                 (wind-card * is expanded)
 *          nav_t  *nav        IO  navigation data
-*          int    opt         I   options (1: only observed, 2: only predicted)
+*          int    opt         I   options (1: only observed + 2: only predicted +
+*                                 4: not combined)
 * return : none
 * notes  : see ref [1]
 *          precise ephemeris is appended and combined
@@ -239,8 +274,8 @@ extern void readsp3(const char *file, nav_t *nav, int opt)
     for (i=j=0;i<n;i++) {
         if (!(ext=strrchr(efiles[i],'.'))) continue;
         
-        if (strcmp (ext,".sp3"  )&&strcmp (ext,".SP3"  )&&
-            strncmp(ext,".eph",4)&&strncmp(ext,".EPH",4)) continue;
+        if (!strstr(ext+1,"sp3")&&!strstr(ext+1,".SP3")&&
+            !strstr(ext+1,"eph")&&!strstr(ext+1,".EPH")) continue;
         
         if (!(fp=fopen(efiles[i],"r"))) {
             trace(2,"sp3 file open error %s\n",efiles[i]);
@@ -257,7 +292,7 @@ extern void readsp3(const char *file, nav_t *nav, int opt)
     for (i=0;i<MAXEXFILE;i++) free(efiles[i]);
     
     /* combine precise ephemeris */
-    if (nav->ne>0) combpeph(nav);
+    if (nav->ne>0) combpeph(nav,opt);
 }
 /* read satellite antenna parameters -------------------------------------------
 * read satellite antenna parameters
@@ -285,12 +320,12 @@ extern int readsap(const char *file, gtime_t time, nav_t *nav)
     return 1;
 }
 /* read dcb parameters file --------------------------------------------------*/
-static int readdcbf(const char *file, nav_t *nav)
+static int readdcbf(const char *file, nav_t *nav, const sta_t *sta)
 {
     FILE *fp;
     double cbias;
-    int sat,type=0;
-    char buff[256];
+    char buff[256],str1[32],str2[32]="";
+    int i,j,sat,type=0;
     
     trace(3,"readdcbf: file=%s\n",file);
     
@@ -304,11 +339,22 @@ static int readdcbf(const char *file, nav_t *nav)
         else if (strstr(buff,"DIFFERENTIAL (P1-C1) CODE BIASES")) type=2;
         else if (strstr(buff,"DIFFERENTIAL (P2-C2) CODE BIASES")) type=3;
         
-        if (!type) continue;
+        if (!type||sscanf(buff,"%s %s",str1,str2)<1) continue;
         
-        if (!(sat=satid2no(buff))||(cbias=str2num(buff,26,9))==0.0) continue;
+        if ((cbias=str2num(buff,26,9))==0.0) continue;
         
-        nav->cbias[sat-1][type-1]=cbias*1E-9*CLIGHT; /* ns -> m */
+        if (sta&&(!strcmp(str1,"G")||!strcmp(str1,"R"))) { /* receiver dcb */
+            for (i=0;i<MAXRCV;i++) {
+                if (!strcmp(sta[i].name,str2)) break;
+            }
+            if (i<MAXRCV) {
+                j=!strcmp(str1,"G")?0:1;
+                nav->rbias[i][j][type-1]=cbias*1E-9*CLIGHT; /* ns -> m */
+            }
+        }
+        else if ((sat=satid2no(str1))) { /* satellite dcb */
+            nav->cbias[sat-1][type-1]=cbias*1E-9*CLIGHT; /* ns -> m */
+        }
     }
     fclose(fp);
     
@@ -318,10 +364,12 @@ static int readdcbf(const char *file, nav_t *nav)
 * read differential code bias (dcb) parameters
 * args   : char   *file       I   dcb parameters file (wild-card * expanded)
 *          nav_t  *nav        IO  navigation data
+*          sta_t  *sta        I   station info data to inport receiver dcb
+*                                 (NULL: no use)
 * return : status (1:ok,0:error)
 * notes  : currently only p1-c1 bias of code *.dcb file
 *-----------------------------------------------------------------------------*/
-extern int readdcb(const char *file, nav_t *nav)
+extern int readdcb(const char *file, nav_t *nav, const sta_t *sta)
 {
     int i,j,n;
     char *efiles[MAXEXFILE]={0};
@@ -340,10 +388,111 @@ extern int readdcb(const char *file, nav_t *nav)
     n=expath(file,efiles,MAXEXFILE);
     
     for (i=0;i<n;i++) {
-        readdcbf(efiles[i],nav);
+        readdcbf(efiles[i],nav,sta);
     }
     for (i=0;i<MAXEXFILE;i++) free(efiles[i]);
     
+    return 1;
+}
+/* add satellite fcb ---------------------------------------------------------*/
+static int addfcb(nav_t *nav, gtime_t ts, gtime_t te, int sat,
+                  const double *bias, const double *std)
+{
+    fcbd_t *nav_fcb;
+    int i,j;
+    
+    if (nav->nf>0&&fabs(timediff(ts,nav->fcb[nav->nf-1].ts))<=1e-3) {
+        for (i=0;i<3;i++) {
+            nav->fcb[nav->nf-1].bias[sat-1][i]=bias[i];
+            nav->fcb[nav->nf-1].std [sat-1][i]=std [i];
+        }
+        return 1;
+    }
+    if (nav->nf>=nav->nfmax) {
+        nav->nfmax=nav->nfmax<=0?2048:nav->nfmax*2;
+        if (!(nav_fcb=(fcbd_t *)realloc(nav->fcb,sizeof(fcbd_t)*nav->nfmax))) {
+            free(nav->fcb); nav->nf=nav->nfmax=0;
+            return 0;
+        }
+        nav->fcb=nav_fcb;
+    }
+    for (i=0;i<MAXSAT;i++) for (j=0;j<3;j++) {
+        nav->fcb[nav->nf].bias[i][j]=nav->fcb[nav->nf].std[i][j]=0.0;
+    }
+    for (i=0;i<3;i++) {
+        nav->fcb[nav->nf].bias[sat-1][i]=bias[i];
+        nav->fcb[nav->nf].std [sat-1][i]=std [i];
+    }
+    nav->fcb[nav->nf  ].ts=ts;
+    nav->fcb[nav->nf++].te=te;
+    return 1;
+}
+/* read satellite fcb file ---------------------------------------------------*/
+static int readfcbf(const char *file, nav_t *nav)
+{
+    FILE *fp;
+    gtime_t ts,te;
+    double ep1[6],ep2[6],bias[3]={0},std[3]={0};
+    char buff[1024],str[32],*p;
+    int sat;
+    
+    trace(3,"readfcbf: file=%s\n",file);
+    
+    if (!(fp=fopen(file,"r"))) {
+        trace(2,"fcb parameters file open error: %s\n",file);
+        return 0;
+    }
+    while (fgets(buff,sizeof(buff),fp)) {
+        if ((p=strchr(buff,'#'))) *p='\0';
+        if (sscanf(buff,"%lf/%lf/%lf %lf:%lf:%lf %lf/%lf/%lf %lf:%lf:%lf %s"
+                   "%lf %lf %lf %lf %lf %lf",ep1,ep1+1,ep1+2,ep1+3,ep1+4,ep1+5,
+                   ep2,ep2+1,ep2+2,ep2+3,ep2+4,ep2+5,str,bias,std,bias+1,std+1,
+                   bias+2,std+2)<17) continue;
+        if (!(sat=satid2no(str))) continue;
+        ts=epoch2time(ep1);
+        te=epoch2time(ep2);
+        if (!addfcb(nav,ts,te,sat,bias,std)) return 0;
+    }
+    fclose(fp);
+    return 1;
+}
+/* compare satellite fcb -----------------------------------------------------*/
+static int cmpfcb(const void *p1, const void *p2)
+{
+    fcbd_t *q1=(fcbd_t *)p1,*q2=(fcbd_t *)p2;
+    double tt=timediff(q1->ts,q2->ts);
+    return tt<-1E-3?-1:(tt>1E-3?1:0);
+}
+/* read satellite fcb data -----------------------------------------------------
+* read satellite fractional cycle bias (dcb) parameters
+* args   : char   *file       I   fcb parameters file (wild-card * expanded)
+*          nav_t  *nav        IO  navigation data
+* return : status (1:ok,0:error)
+* notes  : fcb data appended to navigation data
+*-----------------------------------------------------------------------------*/
+extern int readfcb(const char *file, nav_t *nav)
+{
+    char *efiles[MAXEXFILE]={0};
+    int i,n;
+    
+    trace(3,"readfcb : file=%s\n",file);
+    
+    for (i=0;i<MAXEXFILE;i++) {
+        if (!(efiles[i]=(char *)malloc(1024))) {
+            for (i--;i>=0;i--) free(efiles[i]);
+            return 0;
+        }
+    }
+    n=expath(file,efiles,MAXEXFILE);
+    
+    for (i=0;i<n;i++) {
+        readfcbf(efiles[i],nav);
+    }
+    for (i=0;i<MAXEXFILE;i++) free(efiles[i]);
+    
+    if (nav->nf>1) {
+        qsort(nav->fcb,nav->nf,sizeof(fcbd_t),cmpfcb);
+    }
     return 1;
 }
 /* polynomial interpolation by Neville's algorithm ---------------------------*/
@@ -372,7 +521,7 @@ static int pephpos(gtime_t time, int sat, const nav_t *nav, double *rs,
     if (nav->ne<NMAX+1||
         timediff(time,nav->peph[0].time)<-MAXDTE||
         timediff(time,nav->peph[nav->ne-1].time)>MAXDTE) {
-        trace(2,"no prec ephem %s sat=%2d\n",time_str(time,0),sat);
+        trace(3,"no prec ephem %s sat=%2d\n",time_str(time,0),sat);
         return 0;
     }
     /* binary search */
@@ -389,7 +538,7 @@ static int pephpos(gtime_t time, int sat, const nav_t *nav, double *rs,
     for (j=0;j<=NMAX;j++) {
         t[j]=timediff(nav->peph[i+j].time,time);
         if (norm(nav->peph[i+j].pos[sat-1],3)<=0.0) {
-            trace(2,"prec ephem outage %s sat=%2d\n",time_str(time,0),sat);
+            trace(3,"prec ephem outage %s sat=%2d\n",time_str(time,0),sat);
             return 0;
         }
     }
@@ -476,16 +625,16 @@ static int pephclk(gtime_t time, int sat, const nav_t *nav, double *dts,
     
     if (t[0]<=0.0) {
         if ((dts[0]=c[0])==0.0) return 0;
-        std=nav->pclk[index].std[sat-1][3]*CLIGHT-EXTERR_CLK*t[0];
+        std=nav->pclk[index].std[sat-1][0]*CLIGHT-EXTERR_CLK*t[0];
     }
     else if (t[1]>=0.0) {
         if ((dts[0]=c[1])==0.0) return 0;
-        std=nav->pclk[index+1].std[sat-1][3]*CLIGHT+EXTERR_CLK*t[1];
+        std=nav->pclk[index+1].std[sat-1][0]*CLIGHT+EXTERR_CLK*t[1];
     }
     else if (c[0]!=0.0&&c[1]!=0.0) {
         dts[0]=(c[1]*t[0]-c[0]*t[1])/(t[0]-t[1]);
         i=t[0]<-t[1]?0:1;
-        std=nav->pclk[index+i].std[sat-1][3]+EXTERR_CLK*fabs(t[i]);
+        std=nav->pclk[index+i].std[sat-1][0]*CLIGHT+EXTERR_CLK*fabs(t[i]);
     }
     else {
         trace(3,"prec clock outage %s sat=%2d\n",time_str(time,0),sat);
@@ -499,21 +648,25 @@ static int pephclk(gtime_t time, int sat, const nav_t *nav, double *dts,
 * args   : gtime_t time       I   time (gpst)
 *          double *rs         I   satellite position and velocity (ecef)
 *                                 {x,y,z,vx,vy,vz} (m|m/s)
-*          pcv_t  *pcv        I   satellite antenna parameter
+*          int    sat         I   satellite number
+*          nav_t  *nav        I   navigation data
 *          double *dant       I   satellite antenna phase center offset (ecef)
-*                                 {dx,dy,dz} (m)
+*                                 {dx,dy,dz} (m) (iono-free LC value)
 * return : none
 *-----------------------------------------------------------------------------*/
-extern void satantoff(gtime_t time, const double *rs, const pcv_t *pcv,
+extern void satantoff(gtime_t time, const double *rs, int sat, const nav_t *nav,
                       double *dant)
 {
-    double ex[3],ey[3],ez[3],es[3],r[3],rsun[3],gmst;
-    int i;
+    const double *lam=nav->lam[sat-1];
+    const pcv_t *pcv=nav->pcvs+sat-1;
+    double ex[3],ey[3],ez[3],es[3],r[3],rsun[3],gmst,erpv[5]={0};
+    double gamma,C1,C2,dant1,dant2;
+    int i,j=0,k=1;
     
-    trace(4,"satantoff: time=%s\n",time_str(time,3));
+    trace(4,"satantoff: time=%s sat=%2d\n",time_str(time,3),sat);
     
     /* sun position in ecef */
-    sunmoonpos(gpst2utc(time),NULL,rsun,NULL,&gmst);
+    sunmoonpos(gpst2utc(time),erpv,rsun,NULL,&gmst);
     
     /* unit vectors of satellite fixed coordinates */
     for (i=0;i<3;i++) r[i]=-rs[i];
@@ -524,8 +677,19 @@ extern void satantoff(gtime_t time, const double *rs, const pcv_t *pcv,
     if (!normv3(r,ey)) return;
     cross3(ey,ez,ex);
     
-    for (i=0;i<3;i++) { /* use L1 value */
-        dant[i]=pcv->off[0][0]*ex[i]+pcv->off[0][1]*ey[i]+pcv->off[0][2]*ez[i];
+    if (NFREQ>=3&&(satsys(sat,NULL)&(SYS_GAL|SYS_SBS))) k=2;
+    
+    if (NFREQ<2||lam[j]==0.0||lam[k]==0.0) return;
+    
+    gamma=SQR(lam[k])/SQR(lam[j]);
+    C1=gamma/(gamma-1.0);
+    C2=-1.0 /(gamma-1.0);
+    
+    /* iono-free LC */
+    for (i=0;i<3;i++) {
+        dant1=pcv->off[j][0]*ex[i]+pcv->off[j][1]*ey[i]+pcv->off[j][2]*ez[i];
+        dant2=pcv->off[k][0]*ex[i]+pcv->off[k][1]*ey[i]+pcv->off[k][2]*ez[i];
+        dant[i]=C1*dant1+C2*dant2;
     }
 }
 /* satellite position/clock by precise ephemeris/clock -------------------------
@@ -566,7 +730,7 @@ extern int peph2pos(gtime_t time, int sat, const nav_t *nav, int opt,
     
     /* satellite antenna offset correction */
     if (opt) {
-        satantoff(time,rss,nav->pcvs+sat-1,dant);
+        satantoff(time,rss,sat,nav,dant);
     }
     for (i=0;i<3;i++) {
         rs[i  ]=rss[i]+dant[i];
