@@ -1,12 +1,13 @@
 cmake_minimum_required(VERSION 2.8)
 project(rtklib_gui)
 
-file(GLOB_RECURSE    rtklib_c      src/*.c)
+file(GLOB_RECURSE    rtklib_c      lib/*.c)
+include_directories(lib)
 
 set(sources ${rtklib_c})
 
-add_executable(rtklib ${sources} main.cpp)
 add_executable(str2str ${sources} app/str2str/str2str.c)
+add_executable(rtk_agri ${sources} app/rtk_agri/rtk_agri.c)
 
 ###
 # grouping files for visual studio or xcode
